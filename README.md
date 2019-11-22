@@ -1,5 +1,7 @@
 # chain-kv
 
+Key-value storage for blockchains. Uses RocksDB.
+
 ## Contributing
 
 [Contributing Guide](./CONTRIBUTING.md)
