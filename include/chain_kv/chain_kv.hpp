@@ -100,10 +100,10 @@ struct database {
 
 class view {
  public:
-   database& db;
-
    class iterator;
    using bytes = std::vector<char>;
+
+   database& db;
 
    struct key_value {
       rocksdb::Slice key   = {};
@@ -123,9 +123,7 @@ class view {
 
  private:
    struct vector_compare {
-      bool operator()(const std::vector<char>& a, const std::vector<char>& b) const {
-         return compare_blob(to_slice(a), to_slice(b));
-      }
+      bool operator()(const bytes& a, const bytes& b) const { return compare_blob(to_slice(a), to_slice(b)); }
    };
 
    template <typename T>
@@ -159,11 +157,11 @@ class view {
       friend iterator;
 
       chain_kv::view&                    view;
-      std::vector<char>                  prefix;
+      bytes                              prefix;
       std::unique_ptr<rocksdb::Iterator> rocks_it;
       change_map::iterator               change_it;
 
-      iterator_impl(chain_kv::view& view, std::vector<char> prefix)
+      iterator_impl(chain_kv::view& view, bytes prefix)
           : view{ view }, prefix{ std::move(prefix) }, rocks_it{ view.db.rdb->NewIterator(rocksdb::ReadOptions()) },
             change_it{ view.changes.end() } {}
 
@@ -272,8 +270,7 @@ class view {
       std::unique_ptr<iterator_impl> impl;
 
     public:
-      iterator(view& view, std::vector<char> prefix)
-          : impl{ std::make_unique<iterator_impl>(view, std::move(prefix)) } {}
+      iterator(view& view, bytes prefix) : impl{ std::make_unique<iterator_impl>(view, std::move(prefix)) } {}
 
       iterator(const iterator&) = delete;
       iterator(iterator&&)      = default;
@@ -314,7 +311,7 @@ class view {
             throw exception("kv iterator is not initialized");
       }
 
-      void lower_bound(const std::vector<char>& key) { return lower_bound(key.data(), key.size()); }
+      void lower_bound(const bytes& key) { return lower_bound(key.data(), key.size()); }
 
       bool is_end() const { return !impl || impl->is_end(); }
 
@@ -338,7 +335,7 @@ class view {
       discard_changes();
    }
 
-   bool get(rocksdb::Slice k, std::vector<char>& dest) {
+   bool get(rocksdb::Slice k, bytes& dest) {
       // !!! prefix
       // !!! db, contract
       rocksdb::PinnableSlice v;
