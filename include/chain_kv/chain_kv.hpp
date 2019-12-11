@@ -30,6 +30,22 @@ inline void check(rocksdb::Status s, const char* prefix) {
 
 inline rocksdb::Slice to_slice(const std::vector<char>& v) { return { v.data(), v.size() }; }
 
+template <typename A, typename B>
+inline int compare_blob(const A& a, const B& b) {
+   static_assert(std::is_same_v<std::decay_t<decltype(*a.data())>, char> ||
+                 std::is_same_v<std::decay_t<decltype(*a.data())>, unsigned char>);
+   static_assert(std::is_same_v<std::decay_t<decltype(*b.data())>, char> ||
+                 std::is_same_v<std::decay_t<decltype(*b.data())>, unsigned char>);
+   auto r = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
+   if (r)
+      return r;
+   if (a.size() < b.size())
+      return -1;
+   if (a.size() > b.size())
+      return 1;
+   return 0;
+}
+
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
@@ -106,26 +122,14 @@ class view {
    };
 
  private:
-   static int key_compare(rocksdb::Slice a, rocksdb::Slice b) {
-      int r = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
-      if (r)
-         return r;
-      if (a.size() < b.size())
-         return -1;
-      else if (a.size() > b.size())
-         return 1;
-      else
-         return 0;
-   }
-
    struct vector_compare {
       bool operator()(const std::vector<char>& a, const std::vector<char>& b) const {
-         return key_compare(to_slice(a), to_slice(b));
+         return compare_blob(to_slice(a), to_slice(b));
       }
    };
 
    template <typename T>
-   static int key_compare(const std::optional<T>& a, const std::optional<T>& b) {
+   static int compare_key(const std::optional<T>& a, const std::optional<T>& b) {
       if (!a && !b)
          return 0;
       else if (!a && b)
@@ -133,12 +137,12 @@ class view {
       else if (a && !b)
          return -1;
       else
-         return key_compare(a->key, b->key);
+         return compare_blob(a->key, b->key);
    }
 
    static const std::optional<key_present_value>& key_min(const std::optional<key_present_value>& a,
                                                           const std::optional<key_present_value>& b) {
-      auto cmp = key_compare(a, b);
+      auto cmp = compare_key(a, b);
       if (cmp <= 0)
          return a;
       else
@@ -226,7 +230,7 @@ class view {
       iterator_impl& operator++() {
          auto r   = deref_rocks_it();
          auto c   = deref_change_it();
-         auto cmp = key_compare(r, c);
+         auto cmp = compare_key(r, c);
          do {
             if (cmp < 0) {
                rocks_it->Next();
@@ -238,7 +242,7 @@ class view {
             }
             r   = deref_rocks_it();
             c   = deref_change_it();
-            cmp = key_compare(r, c);
+            cmp = compare_key(r, c);
          } while (cmp > 0 && !c->present);
          rocks_verify_prefix();
          changed_verify_prefix();
@@ -277,7 +281,7 @@ class view {
       iterator& operator=(const iterator&) = delete;
       iterator& operator=(iterator&&) = default;
 
-      friend int  compare(const iterator& a, const iterator& b) { return view::key_compare(a.get_kv(), b.get_kv()); }
+      friend int  compare(const iterator& a, const iterator& b) { return view::compare_key(a.get_kv(), b.get_kv()); }
       friend bool operator==(const iterator& a, const iterator& b) { return compare(a, b) == 0; }
       friend bool operator<(const iterator& a, const iterator& b) { return compare(a, b) < 0; }
 
@@ -335,21 +339,30 @@ class view {
    }
 
    bool get(rocksdb::Slice k, std::vector<char>& dest) {
+      // !!! prefix
+      // !!! db, contract
       rocksdb::PinnableSlice v;
       auto                   stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), k, &v);
-      if (stat.IsNotFound())
+      if (stat.IsNotFound()) {
+         dest.clear();
          return false;
+      }
       check(stat, "get: ");
       dest.assign(v.data(), v.data() + v.size());
       return true;
    }
 
    void set(rocksdb::Slice k, rocksdb::Slice v) {
+      // !!! prefix
+      // !!! db, contract
       write_batch.Put(k, v);
       changes[{ k.data(), k.data() + k.size() }] = { true, { v.data(), v.data() + v.size() } };
    }
 
    void erase(rocksdb::Slice k) {
+      // !!! prefix
+      // !!! db, contract
+      // !!! iterator invalidation rule change
       write_batch.Delete(k);
       changes[{ k.data(), k.data() + k.size() }] = { false, {} };
    }
