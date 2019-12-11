@@ -46,6 +46,12 @@ inline int compare_blob(const A& a, const B& b) {
    return 0;
 }
 
+using bytes = std::vector<char>;
+
+struct bytes_compare {
+   bool operator()(const bytes& a, const bytes& b) const { return compare_blob(to_slice(a), to_slice(b)); }
+};
+
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
@@ -98,59 +104,53 @@ struct database {
 
 }; // database
 
+struct key_value {
+   rocksdb::Slice key   = {};
+   rocksdb::Slice value = {};
+};
+
+struct key_present_value {
+   rocksdb::Slice key     = {};
+   bool           present = {};
+   rocksdb::Slice value   = {};
+};
+
+template <typename T>
+int compare_key(const std::optional<T>& a, const std::optional<T>& b) {
+   if (!a && !b)
+      return 0;
+   else if (!a && b)
+      return 1;
+   else if (a && !b)
+      return -1;
+   else
+      return compare_blob(a->key, b->key);
+}
+
+inline const std::optional<key_present_value>& key_min(const std::optional<key_present_value>& a,
+                                                       const std::optional<key_present_value>& b) {
+   auto cmp = compare_key(a, b);
+   if (cmp <= 0)
+      return a;
+   else
+      return b;
+}
+
+struct cached_value {
+   std::optional<bytes> current_value = {};
+};
+
+using cache_map = std::map<bytes, cached_value, bytes_compare>;
+
 class view {
  public:
    class iterator;
-   using bytes = std::vector<char>;
 
    database& db;
 
-   struct key_value {
-      rocksdb::Slice key   = {};
-      rocksdb::Slice value = {};
-   };
-
-   struct key_present_value {
-      rocksdb::Slice key     = {};
-      bool           present = {};
-      rocksdb::Slice value   = {};
-   };
-
-   struct present_value {
-      bool  present = {};
-      bytes value   = {};
-   };
-
  private:
-   struct vector_compare {
-      bool operator()(const bytes& a, const bytes& b) const { return compare_blob(to_slice(a), to_slice(b)); }
-   };
-
-   template <typename T>
-   static int compare_key(const std::optional<T>& a, const std::optional<T>& b) {
-      if (!a && !b)
-         return 0;
-      else if (!a && b)
-         return 1;
-      else if (a && !b)
-         return -1;
-      else
-         return compare_blob(a->key, b->key);
-   }
-
-   static const std::optional<key_present_value>& key_min(const std::optional<key_present_value>& a,
-                                                          const std::optional<key_present_value>& b) {
-      auto cmp = compare_key(a, b);
-      if (cmp <= 0)
-         return a;
-      else
-         return b;
-   }
-
-   using change_map = std::map<bytes, present_value, vector_compare>;
-
    rocksdb::WriteBatch write_batch;
-   change_map          changes;
+   cache_map           cache;
 
    struct iterator_impl {
       friend chain_kv::view;
@@ -159,11 +159,11 @@ class view {
       chain_kv::view&                    view;
       bytes                              prefix;
       std::unique_ptr<rocksdb::Iterator> rocks_it;
-      change_map::iterator               change_it;
+      cache_map::iterator                cache_it;
 
       iterator_impl(chain_kv::view& view, bytes prefix)
           : view{ view }, prefix{ std::move(prefix) }, rocks_it{ view.db.rdb->NewIterator(rocksdb::ReadOptions()) },
-            change_it{ view.changes.end() } {}
+            cache_it{ view.cache.end() } {}
 
       iterator_impl(const iterator_impl&) = delete;
       iterator_impl& operator=(const iterator_impl&) = delete;
@@ -180,18 +180,18 @@ class view {
       }
 
       void changed_verify_prefix() {
-         if (change_it == view.changes.end())
+         if (cache_it == view.cache.end())
             return;
-         auto& k = change_it->first;
+         auto& k = cache_it->first;
          if (k.size() >= prefix.size() && !memcmp(k.data(), prefix.data(), prefix.size()))
             return;
-         change_it = view.changes.end();
+         cache_it = view.cache.end();
       }
 
       void move_to_begin() {
          rocks_it->Seek({ prefix.data(), prefix.size() });
          rocks_verify_prefix();
-         change_it = view.changes.lower_bound(prefix);
+         cache_it = view.cache.lower_bound(prefix);
          changed_verify_prefix();
       }
 
@@ -199,7 +199,7 @@ class view {
          rocks_it->SeekToLast();
          if (rocks_it->Valid())
             rocks_it->Next();
-         change_it = view.changes.end();
+         cache_it = view.cache.end();
       }
 
       void lower_bound(const char* key, size_t size) {
@@ -207,7 +207,7 @@ class view {
             throw exception("lower_bound: prefix doesn't match");
          rocks_it->Seek({ key, size });
          rocks_verify_prefix();
-         change_it = view.changes.lower_bound({ key, key + size });
+         cache_it = view.cache.lower_bound({ key, key + size });
          changed_verify_prefix();
       }
 
@@ -233,10 +233,10 @@ class view {
             if (cmp < 0) {
                rocks_it->Next();
             } else if (cmp > 0) {
-               ++change_it;
+               ++cache_it;
             } else if (r && c) {
                rocks_it->Next();
-               ++change_it;
+               ++cache_it;
             }
             r   = deref_rocks_it();
             c   = deref_change_it();
@@ -255,10 +255,14 @@ class view {
       }
 
       std::optional<key_present_value> deref_change_it() {
-         if (change_it != view.changes.end())
-            return { { to_slice(change_it->first), change_it->second.present, to_slice(change_it->second.value) } };
-         else
+         if (cache_it != view.cache.end()) {
+            if (cache_it->second.current_value)
+               return { { to_slice(cache_it->first), true, to_slice(*cache_it->second.current_value) } };
+            else
+               return { { to_slice(cache_it->first), false, {} } };
+         } else {
             return {};
+         }
       }
    }; // iterator_impl
 
@@ -278,7 +282,7 @@ class view {
       iterator& operator=(const iterator&) = delete;
       iterator& operator=(iterator&&) = default;
 
-      friend int  compare(const iterator& a, const iterator& b) { return view::compare_key(a.get_kv(), b.get_kv()); }
+      friend int  compare(const iterator& a, const iterator& b) { return compare_key(a.get_kv(), b.get_kv()); }
       friend bool operator==(const iterator& a, const iterator& b) { return compare(a, b) == 0; }
       friend bool operator<(const iterator& a, const iterator& b) { return compare(a, b) < 0; }
 
@@ -327,7 +331,7 @@ class view {
 
    void discard_changes() {
       write_batch.Clear();
-      changes.clear();
+      cache.clear();
    }
 
    void write_changes() {
@@ -353,7 +357,7 @@ class view {
       // !!! prefix
       // !!! db, contract
       write_batch.Put(k, v);
-      changes[{ k.data(), k.data() + k.size() }] = { true, { v.data(), v.data() + v.size() } };
+      cache[{ k.data(), k.data() + k.size() }] = { bytes{ v.data(), v.data() + v.size() } };
    }
 
    void erase(rocksdb::Slice k) {
@@ -361,7 +365,7 @@ class view {
       // !!! db, contract
       // !!! iterator invalidation rule change
       write_batch.Delete(k);
-      changes[{ k.data(), k.data() + k.size() }] = { false, {} };
+      cache[{ k.data(), k.data() + k.size() }] = { std::nullopt };
    }
 }; // view
 
