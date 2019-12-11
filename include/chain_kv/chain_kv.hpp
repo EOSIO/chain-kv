@@ -48,9 +48,22 @@ inline int compare_blob(const A& a, const B& b) {
 
 using bytes = std::vector<char>;
 
-struct bytes_compare {
-   bool operator()(const bytes& a, const bytes& b) const { return compare_blob(to_slice(a), to_slice(b)); }
+struct less_blob {
+   using is_transparent = void;
+
+   template <typename A, typename B>
+   bool operator()(const A& a, const B& b) const {
+      return compare_blob(a, b) < 0;
+   }
 };
+
+template <typename T>
+auto append_key(std::vector<char>& dest, T value) -> std::enable_if_t<std::is_arithmetic_v<T>, void> {
+   char buf[sizeof(value)];
+   memcpy(buf, &value, sizeof(value));
+   std::reverse(std::begin(buf), std::end(buf));
+   dest.insert(dest.end(), std::begin(buf), std::end(buf));
+}
 
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
@@ -140,7 +153,7 @@ struct cached_value {
    std::optional<bytes> current_value = {};
 };
 
-using cache_map = std::map<bytes, cached_value, bytes_compare>;
+using cache_map = std::map<bytes, cached_value, less_blob>;
 
 class view {
  public:
@@ -340,16 +353,35 @@ class view {
    }
 
    bool get(rocksdb::Slice k, bytes& dest) {
-      // !!! prefix
-      // !!! db, contract
+      bytes    view_prefix;  // !!! temp
+      uint64_t contract = 0; // !!! temp
+
+      std::vector<char> adjusted_key;
+      adjusted_key.reserve(view_prefix.size() + sizeof(contract) + k.size());
+      adjusted_key.insert(adjusted_key.end(), view_prefix.begin(), view_prefix.end());
+      append_key(adjusted_key, contract);
+      adjusted_key.insert(adjusted_key.end(), k.data(), k.data() + k.size());
+
+      auto it = cache.find(adjusted_key);
+      if (it != cache.end()) {
+         if (it->second.current_value)
+            dest = *it->second.current_value;
+         else
+            dest.clear();
+         return it->second.current_value.has_value();
+      }
+
       rocksdb::PinnableSlice v;
-      auto                   stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), k, &v);
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(adjusted_key), &v);
       if (stat.IsNotFound()) {
          dest.clear();
          return false;
       }
       check(stat, "get: ");
       dest.assign(v.data(), v.data() + v.size());
+
+      cache[adjusted_key].current_value = dest;
+
       return true;
    }
 
