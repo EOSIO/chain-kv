@@ -58,11 +58,21 @@ struct less_blob {
 };
 
 template <typename T>
-auto append_key(std::vector<char>& dest, T value) -> std::enable_if_t<std::is_arithmetic_v<T>, void> {
+auto append_key(bytes& dest, T value) -> std::enable_if_t<std::is_arithmetic_v<T>, void> {
    char buf[sizeof(value)];
    memcpy(buf, &value, sizeof(value));
    std::reverse(std::begin(buf), std::end(buf));
    dest.insert(dest.end(), std::begin(buf), std::end(buf));
+}
+
+template <typename T>
+bytes prefix_key(const bytes& prefix, uint64_t contract, const T& key) {
+   bytes result;
+   result.reserve(prefix.size() + sizeof(contract) + key.size());
+   result.insert(result.end(), prefix.begin(), prefix.end());
+   append_key(result, contract);
+   result.insert(result.end(), key.data(), key.data() + key.size());
+   return result;
 }
 
 struct database {
@@ -75,10 +85,7 @@ struct database {
       options.create_if_missing = create_if_missing;
 
       options.level_compaction_dynamic_level_bytes = true;
-      options.max_background_compactions           = 4;
-      options.max_background_flushes               = 2;
       options.bytes_per_sync                       = 1048576;
-      options.compaction_pri                       = rocksdb::kMinOverlappingRatio;
 
       if (threads)
          options.IncreaseParallelism(*threads);
@@ -160,6 +167,7 @@ class view {
    class iterator;
 
    database& db;
+   bytes     prefix;
 
  private:
    rocksdb::WriteBatch write_batch;
@@ -171,12 +179,15 @@ class view {
 
       chain_kv::view&                    view;
       bytes                              prefix;
-      std::unique_ptr<rocksdb::Iterator> rocks_it;
       cache_map::iterator                cache_it;
+      std::unique_ptr<rocksdb::Iterator> rocks_it;
 
-      iterator_impl(chain_kv::view& view, bytes prefix)
-          : view{ view }, prefix{ std::move(prefix) }, rocks_it{ view.db.rdb->NewIterator(rocksdb::ReadOptions()) },
-            cache_it{ view.cache.end() } {}
+      iterator_impl(chain_kv::view& view, uint64_t contract, const rocksdb::Slice& prefix)
+          : view{ view },                                                //
+            prefix{ prefix_key(view.prefix, contract, prefix) },         //
+            cache_it{ view.cache.end() },                                //
+            rocks_it{ view.db.rdb->NewIterator(rocksdb::ReadOptions()) } //
+      {}
 
       iterator_impl(const iterator_impl&) = delete;
       iterator_impl& operator=(const iterator_impl&) = delete;
@@ -287,7 +298,8 @@ class view {
       std::unique_ptr<iterator_impl> impl;
 
     public:
-      iterator(view& view, bytes prefix) : impl{ std::make_unique<iterator_impl>(view, std::move(prefix)) } {}
+      iterator(view& view, uint64_t contract, const rocksdb::Slice& prefix)
+          : impl{ std::make_unique<iterator_impl>(view, contract, std::move(prefix)) } {}
 
       iterator(const iterator&) = delete;
       iterator(iterator&&)      = default;
@@ -340,7 +352,7 @@ class view {
       }
    };
 
-   view(database& db) : db{ db } {}
+   view(database& db, bytes prefix) : db{ db }, prefix{ std::move(prefix) } {}
 
    void discard_changes() {
       write_batch.Clear();
@@ -352,17 +364,10 @@ class view {
       discard_changes();
    }
 
-   bool get(rocksdb::Slice k, bytes& dest) {
-      bytes    view_prefix;  // !!! temp
-      uint64_t contract = 0; // !!! temp
+   bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
+      auto prefixed = prefix_key(prefix, contract, k);
 
-      std::vector<char> adjusted_key;
-      adjusted_key.reserve(view_prefix.size() + sizeof(contract) + k.size());
-      adjusted_key.insert(adjusted_key.end(), view_prefix.begin(), view_prefix.end());
-      append_key(adjusted_key, contract);
-      adjusted_key.insert(adjusted_key.end(), k.data(), k.data() + k.size());
-
-      auto it = cache.find(adjusted_key);
+      auto it = cache.find(prefixed);
       if (it != cache.end()) {
          if (it->second.current_value)
             dest = *it->second.current_value;
@@ -372,7 +377,7 @@ class view {
       }
 
       rocksdb::PinnableSlice v;
-      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(adjusted_key), &v);
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(prefixed), &v);
       if (stat.IsNotFound()) {
          dest.clear();
          return false;
@@ -380,24 +385,22 @@ class view {
       check(stat, "get: ");
       dest.assign(v.data(), v.data() + v.size());
 
-      cache[adjusted_key].current_value = dest;
+      cache[prefixed].current_value = dest;
 
       return true;
    }
 
-   void set(rocksdb::Slice k, rocksdb::Slice v) {
-      // !!! prefix
-      // !!! db, contract
-      write_batch.Put(k, v);
-      cache[{ k.data(), k.data() + k.size() }] = { bytes{ v.data(), v.data() + v.size() } };
+   void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
+      auto prefixed = prefix_key(prefix, contract, k);
+      write_batch.Put(to_slice(prefixed), v);
+      cache[prefixed] = { bytes{ v.data(), v.data() + v.size() } };
    }
 
-   void erase(rocksdb::Slice k) {
-      // !!! prefix
-      // !!! db, contract
+   void erase(uint64_t contract, const rocksdb::Slice& k) {
       // !!! iterator invalidation rule change
-      write_batch.Delete(k);
-      cache[{ k.data(), k.data() + k.size() }] = { std::nullopt };
+      auto prefixed = prefix_key(prefix, contract, k);
+      write_batch.Delete(to_slice(prefixed));
+      cache[prefixed] = { std::nullopt };
    }
 }; // view
 
