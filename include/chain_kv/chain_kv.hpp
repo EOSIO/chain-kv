@@ -80,15 +80,14 @@ struct database {
 
    database(const char* db_path, bool create_if_missing, std::optional<uint32_t> threads,
             std::optional<uint32_t> max_open_files) {
-      rocksdb::DB*     p;
       rocksdb::Options options;
-      options.create_if_missing = create_if_missing;
-
+      options.create_if_missing                    = create_if_missing;
       options.level_compaction_dynamic_level_bytes = true;
       options.bytes_per_sync                       = 1048576;
 
       if (threads)
          options.IncreaseParallelism(*threads);
+
       options.OptimizeLevelStyleCompaction(256ull << 20);
       for (auto& x : options.compression_per_level) // todo: fix snappy build
          x = rocksdb::kNoCompression;
@@ -101,8 +100,28 @@ struct database {
       table_options.index_block_restart_interval = 16;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
+      rocksdb::DB* p;
       check(rocksdb::DB::Open(options, db_path, &p), "rocksdb::DB::Open: ");
       rdb.reset(p);
+
+      // Sentinals with keys 0x00 and 0xff simplify iteration logic.
+      // Views have prefixes which must start with a byte within the range 0x01 - 0xfe.
+      rocksdb::WriteBatch batch;
+      bool                modified       = false;
+      auto                write_sentinal = [&](const bytes& k) {
+         rocksdb::PinnableSlice v;
+         auto                   stat = rdb->Get(rocksdb::ReadOptions(), rdb->DefaultColumnFamily(), to_slice(k), &v);
+         if (stat.IsNotFound()) {
+            check(batch.Put(to_slice(k), {}), "put: ");
+            modified = true;
+         } else {
+            check(stat, "get: ");
+         }
+      };
+      write_sentinal({ 0x00 });
+      write_sentinal({ (char)0xff });
+      if (modified)
+         write(batch);
    }
 
    database(database&&) = default;
@@ -121,7 +140,6 @@ struct database {
       check(rdb->Write(opt, &batch), "write batch");
       batch.Clear();
    }
-
 }; // database
 
 struct key_value {
@@ -129,14 +147,7 @@ struct key_value {
    rocksdb::Slice value = {};
 };
 
-struct key_present_value {
-   rocksdb::Slice key     = {};
-   bool           present = {};
-   rocksdb::Slice value   = {};
-};
-
-template <typename T>
-int compare_key(const std::optional<T>& a, const std::optional<T>& b) {
+inline int compare_key(const std::optional<key_value>& a, const std::optional<key_value>& b) {
    if (!a && !b)
       return 0;
    else if (!a && b)
@@ -145,15 +156,6 @@ int compare_key(const std::optional<T>& a, const std::optional<T>& b) {
       return -1;
    else
       return compare_blob(a->key, b->key);
-}
-
-inline const std::optional<key_present_value>& key_min(const std::optional<key_present_value>& a,
-                                                       const std::optional<key_present_value>& b) {
-   auto cmp = compare_key(a, b);
-   if (cmp <= 0)
-      return a;
-   else
-      return b;
 }
 
 struct cached_value {
@@ -173,120 +175,126 @@ class view {
    rocksdb::WriteBatch write_batch;
    cache_map           cache;
 
+   cache_map::iterator fill_cache(const rocksdb::Slice& k, const rocksdb::Slice& v) {
+      cache_map::iterator it;
+      bool                b;
+      it = cache.find(k);
+      if (it != cache.end())
+         return it;
+      std::tie(it, b) = cache.insert(cache_map::value_type{ bytes{ k.data(), k.data() + k.size() },
+                                                            cached_value{ bytes{ v.data(), v.data() + v.size() } } });
+      return it;
+   }
+
    struct iterator_impl {
       friend chain_kv::view;
       friend iterator;
 
       chain_kv::view&                    view;
       bytes                              prefix;
+      size_t                             hidden_prefix_size;
+      bytes                              next_prefix;
       cache_map::iterator                cache_it;
       std::unique_ptr<rocksdb::Iterator> rocks_it;
 
       iterator_impl(chain_kv::view& view, uint64_t contract, const rocksdb::Slice& prefix)
           : view{ view },                                                //
             prefix{ prefix_key(view.prefix, contract, prefix) },         //
-            cache_it{ view.cache.end() },                                //
+            hidden_prefix_size{ view.prefix.size() + sizeof(contract) }, //
             rocks_it{ view.db.rdb->NewIterator(rocksdb::ReadOptions()) } //
-      {}
+      {
+         next_prefix = this->prefix;
+         while (!next_prefix.empty()) {
+            if (++next_prefix.back())
+               break;
+            next_prefix.pop_back();
+         }
+         move_to_end();
+      }
 
       iterator_impl(const iterator_impl&) = delete;
       iterator_impl& operator=(const iterator_impl&) = delete;
 
-      void rocks_verify_prefix() {
-         if (!rocks_it->Valid())
-            return;
-         auto k = rocks_it->key();
-         if (k.size() >= prefix.size() && !memcmp(k.data(), prefix.data(), prefix.size()))
-            return;
-         rocks_it->SeekToLast();
-         if (rocks_it->Valid())
-            rocks_it->Next();
-      }
+      void move_to_begin() { lower_bound_full_key(prefix); }
 
-      void changed_verify_prefix() {
-         if (cache_it == view.cache.end())
-            return;
-         auto& k = cache_it->first;
-         if (k.size() >= prefix.size() && !memcmp(k.data(), prefix.data(), prefix.size()))
-            return;
-         cache_it = view.cache.end();
-      }
-
-      void move_to_begin() {
-         rocks_it->Seek({ prefix.data(), prefix.size() });
-         rocks_verify_prefix();
-         cache_it = view.cache.lower_bound(prefix);
-         changed_verify_prefix();
-      }
-
-      void move_to_end() {
-         rocks_it->SeekToLast();
-         if (rocks_it->Valid())
-            rocks_it->Next();
-         cache_it = view.cache.end();
-      }
+      void move_to_end() { cache_it = view.cache.end(); }
 
       void lower_bound(const char* key, size_t size) {
-         if (size < prefix.size() || memcmp(key, prefix.data(), prefix.size()))
-            throw exception("lower_bound: prefix doesn't match");
-         rocks_it->Seek({ key, size });
-         rocks_verify_prefix();
-         cache_it = view.cache.lower_bound({ key, key + size });
-         changed_verify_prefix();
+         auto x = compare_blob(rocksdb::Slice{ key, size }, rocksdb::Slice{ prefix.data() + hidden_prefix_size,
+                                                                            prefix.size() - hidden_prefix_size });
+         if (x < 0) {
+            key  = prefix.data() + hidden_prefix_size;
+            size = prefix.size() - hidden_prefix_size;
+         }
+
+         bytes full_key;
+         full_key.reserve(hidden_prefix_size + size);
+         full_key.insert(full_key.end(), prefix.data(), prefix.data() + hidden_prefix_size);
+         full_key.insert(full_key.end(), key, key + size);
+         lower_bound_full_key(full_key);
+      }
+
+      void lower_bound_full_key(const bytes& full_key) {
+         rocks_it->Seek(to_slice(full_key));
+         check(rocks_it->status(), "seek: ");
+         cache_it = view.fill_cache(rocks_it->key(), rocks_it->value());
+         if (compare_blob(cache_it->first, to_slice(full_key)))
+            cache_it = view.cache.lower_bound(full_key);
+         if (compare_blob(cache_it->first, next_prefix) >= 0)
+            cache_it = view.cache.end();
       }
 
       std::optional<key_value> get_kv() {
-         auto r   = deref_rocks_it();
-         auto c   = deref_change_it();
-         auto min = key_min(r, c);
-         if (min) {
-            if (min->present)
-               return key_value{ min->key, min->value };
-            move_to_end(); // invalidate iterator since it is at a removed element
-         }
-         return {};
+         if (cache_it == view.cache.end())
+            return {};
+         if (!cache_it->second.current_value)
+            throw exception("kv iterator is at an erased value");
+         return key_value{ rocksdb::Slice{ cache_it->first.data() + hidden_prefix_size,
+                                           cache_it->first.size() - hidden_prefix_size },
+                           to_slice(*cache_it->second.current_value) };
       }
 
-      bool is_end() { return !get_kv(); }
+      bool is_end() { return cache_it == view.cache.end(); }
+
+      bool is_valid() { return cache_it != view.cache.end() && cache_it->second.current_value; }
 
       iterator_impl& operator++() {
-         auto r   = deref_rocks_it();
-         auto c   = deref_change_it();
-         auto cmp = compare_key(r, c);
+         if (cache_it == view.cache.end()) {
+            move_to_begin();
+            return *this;
+         } else if (!cache_it->second.current_value)
+            throw exception("kv iterator is at an erased value");
          do {
-            if (cmp < 0) {
+            while (compare_blob(rocks_it->key(), cache_it->first) <= 0) {
                rocks_it->Next();
-            } else if (cmp > 0) {
-               ++cache_it;
-            } else if (r && c) {
-               rocks_it->Next();
-               ++cache_it;
+               check(rocks_it->status(), "next: ");
+               view.fill_cache(rocks_it->key(), rocks_it->value());
             }
-            r   = deref_rocks_it();
-            c   = deref_change_it();
-            cmp = compare_key(r, c);
-         } while (cmp > 0 && !c->present);
-         rocks_verify_prefix();
-         changed_verify_prefix();
+            ++cache_it;
+         } while (!cache_it->second.current_value);
+         if (compare_blob(cache_it->first, next_prefix) >= 0)
+            cache_it = view.cache.end();
          return *this;
       }
 
-      std::optional<key_present_value> deref_rocks_it() {
-         if (rocks_it->Valid())
-            return { { rocks_it->key(), true, rocks_it->value() } };
-         else
-            return {};
-      }
-
-      std::optional<key_present_value> deref_change_it() {
-         if (cache_it != view.cache.end()) {
-            if (cache_it->second.current_value)
-               return { { to_slice(cache_it->first), true, to_slice(*cache_it->second.current_value) } };
-            else
-               return { { to_slice(cache_it->first), false, {} } };
-         } else {
-            return {};
-         }
+      iterator_impl& operator--() {
+         if (cache_it == view.cache.end()) {
+            rocks_it->Seek(to_slice(next_prefix));
+            check(rocks_it->status(), "seek: ");
+            cache_it = view.fill_cache(rocks_it->key(), rocks_it->value());
+         } else if (!cache_it->second.current_value)
+            throw exception("kv iterator is at an erased value");
+         do {
+            while (compare_blob(rocks_it->key(), cache_it->first) >= 0) {
+               rocks_it->Prev();
+               check(rocks_it->status(), "prev: ");
+               view.fill_cache(rocks_it->key(), rocks_it->value());
+            }
+            --cache_it;
+         } while (!cache_it->second.current_value);
+         if (compare_blob(cache_it->first, prefix) < 0)
+            cache_it = view.cache.end();
+         return *this;
       }
    }; // iterator_impl
 
@@ -319,6 +327,14 @@ class view {
          return *this;
       }
 
+      iterator& operator--() {
+         if (impl)
+            --*impl;
+         else
+            throw exception("kv iterator is not initialized");
+         return *this;
+      }
+
       void move_to_begin() {
          if (impl)
             impl->move_to_begin();
@@ -344,6 +360,8 @@ class view {
 
       bool is_end() const { return !impl || impl->is_end(); }
 
+      bool is_valid() const { return impl && impl->is_valid(); }
+
       std::optional<key_value> get_kv() const {
          if (impl)
             return impl->get_kv();
@@ -352,7 +370,15 @@ class view {
       }
    };
 
-   view(database& db, bytes prefix) : db{ db }, prefix{ std::move(prefix) } {}
+   view(database& db, bytes prefix) : db{ db }, prefix{ std::move(prefix) } {
+      if (this->prefix.empty())
+         throw exception("kv view may not have empty prefix");
+
+      // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
+      // invalid during iteration.
+      if (this->prefix[0] == 0x00 || this->prefix[1] == (char)0xff)
+         throw exception("view may not have a prefix which begins with 0x00 or 0xff");
+   }
 
    void discard_changes() {
       write_batch.Clear();
@@ -384,24 +410,22 @@ class view {
       }
       check(stat, "get: ");
       dest.assign(v.data(), v.data() + v.size());
-
       cache[prefixed].current_value = dest;
-
       return true;
    }
 
    void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
       auto prefixed = prefix_key(prefix, contract, k);
-      write_batch.Put(to_slice(prefixed), v);
+      check(write_batch.Put(to_slice(prefixed), v), "set: ");
       cache[prefixed] = { bytes{ v.data(), v.data() + v.size() } };
    }
 
    void erase(uint64_t contract, const rocksdb::Slice& k) {
       // !!! iterator invalidation rule change
       auto prefixed = prefix_key(prefix, contract, k);
-      write_batch.Delete(to_slice(prefixed));
+      check(write_batch.Delete(to_slice(prefixed)), "erase: ");
       cache[prefixed] = { std::nullopt };
    }
-}; // view
+}; // namespace chain_kv
 
 } // namespace chain_kv
