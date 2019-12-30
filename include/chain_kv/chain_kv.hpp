@@ -58,7 +58,7 @@ struct less_blob {
 };
 
 template <typename T>
-auto append_key(bytes& dest, T value) -> std::enable_if_t<std::is_arithmetic_v<T>, void> {
+auto append_key(bytes& dest, T value) -> std::enable_if_t<std::is_unsigned_v<T>, void> {
    char buf[sizeof(value)];
    memcpy(buf, &value, sizeof(value));
    std::reverse(std::begin(buf), std::end(buf));
@@ -168,8 +168,8 @@ class view {
  public:
    class iterator;
 
-   database& db;
-   bytes     prefix;
+   database&   db;
+   const bytes prefix;
 
  private:
    rocksdb::WriteBatch write_batch;
@@ -305,6 +305,11 @@ class view {
     private:
       std::unique_ptr<iterator_impl> impl;
 
+      void check_initialized() const {
+         if (!impl)
+            throw exception("kv iterator is not initialized");
+      }
+
     public:
       iterator(view& view, uint64_t contract, const rocksdb::Slice& prefix)
           : impl{ std::make_unique<iterator_impl>(view, contract, std::move(prefix)) } {}
@@ -320,53 +325,47 @@ class view {
       friend bool operator<(const iterator& a, const iterator& b) { return compare(a, b) < 0; }
 
       iterator& operator++() {
-         if (impl)
-            ++*impl;
-         else
-            throw exception("kv iterator is not initialized");
+         check_initialized();
+         ++*impl;
          return *this;
       }
 
       iterator& operator--() {
-         if (impl)
-            --*impl;
-         else
-            throw exception("kv iterator is not initialized");
+         check_initialized();
+         --*impl;
          return *this;
       }
 
       void move_to_begin() {
-         if (impl)
-            impl->move_to_begin();
-         else
-            throw exception("kv iterator is not initialized");
+         check_initialized();
+         impl->move_to_begin();
       }
 
       void move_to_end() {
-         if (impl)
-            impl->move_to_end();
-         else
-            throw exception("kv iterator is not initialized");
+         check_initialized();
+         impl->move_to_end();
       }
 
       void lower_bound(const char* key, size_t size) {
-         if (impl)
-            return impl->lower_bound(key, size);
-         else
-            throw exception("kv iterator is not initialized");
+         check_initialized();
+         impl->lower_bound(key, size);
       }
 
-      void lower_bound(const bytes& key) { return lower_bound(key.data(), key.size()); }
+      void lower_bound(const bytes& key) { lower_bound(key.data(), key.size()); }
 
-      bool is_end() const { return !impl || impl->is_end(); }
+      bool is_end() const {
+         check_initialized();
+         return impl->is_end();
+      }
 
-      bool is_valid() const { return impl && impl->is_valid(); }
+      bool is_valid() const {
+         check_initialized();
+         return impl->is_valid();
+      }
 
       std::optional<key_value> get_kv() const {
-         if (impl)
-            return impl->get_kv();
-         else
-            return {};
+         check_initialized();
+         return impl->get_kv();
       }
    };
 
@@ -376,19 +375,11 @@ class view {
 
       // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
       // invalid during iteration.
-      if (this->prefix[0] == 0x00 || this->prefix[1] == (char)0xff)
+      if (this->prefix[0] == 0x00 || this->prefix[0] == (char)0xff)
          throw exception("view may not have a prefix which begins with 0x00 or 0xff");
    }
 
-   void discard_changes() {
-      write_batch.Clear();
-      cache.clear();
-   }
-
-   void write_changes() {
-      db.write(write_batch);
-      discard_changes();
-   }
+   void write_changes() { db.write(write_batch); }
 
    bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
       auto prefixed = prefix_key(prefix, contract, k);
@@ -426,6 +417,6 @@ class view {
       check(write_batch.Delete(to_slice(prefixed)), "erase: ");
       cache[prefixed] = { std::nullopt };
    }
-}; // namespace chain_kv
+}; // view
 
 } // namespace chain_kv
