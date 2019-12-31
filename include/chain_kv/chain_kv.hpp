@@ -159,6 +159,7 @@ inline int compare_key(const std::optional<key_value>& a, const std::optional<ke
 }
 
 struct cached_value {
+   uint64_t             num_erases    = 0;
    std::optional<bytes> current_value = {};
 };
 
@@ -181,8 +182,9 @@ class view {
       it = cache.find(k);
       if (it != cache.end())
          return it;
-      std::tie(it, b) = cache.insert(cache_map::value_type{ bytes{ k.data(), k.data() + k.size() },
-                                                            cached_value{ bytes{ v.data(), v.data() + v.size() } } });
+      std::tie(it, b) =
+            cache.insert(cache_map::value_type{ bytes{ k.data(), k.data() + k.size() }, //
+                                                cached_value{ 0, bytes{ v.data(), v.data() + v.size() } } });
       return it;
    }
 
@@ -195,6 +197,7 @@ class view {
       size_t                             hidden_prefix_size;
       bytes                              next_prefix;
       cache_map::iterator                cache_it;
+      uint64_t                           cache_it_num_erases = 0;
       std::unique_ptr<rocksdb::Iterator> rocks_it;
 
       iterator_impl(chain_kv::view& view, uint64_t contract, const rocksdb::Slice& prefix)
@@ -209,6 +212,17 @@ class view {
                break;
             next_prefix.pop_back();
          }
+
+         rocks_it->Seek(to_slice(this->prefix));
+         check(rocks_it->status(), "seek: ");
+         view.fill_cache(rocks_it->key(), rocks_it->value());
+         rocks_it->Prev();
+         check(rocks_it->status(), "prev: ");
+         view.fill_cache(rocks_it->key(), rocks_it->value());
+         rocks_it->Seek(to_slice(next_prefix));
+         check(rocks_it->status(), "seek: ");
+         view.fill_cache(rocks_it->key(), rocks_it->value());
+
          move_to_end();
       }
 
@@ -240,14 +254,24 @@ class view {
          cache_it = view.fill_cache(rocks_it->key(), rocks_it->value());
          if (compare_blob(cache_it->first, to_slice(full_key)))
             cache_it = view.cache.lower_bound(full_key);
+         while (!cache_it->second.current_value) {
+            while (compare_blob(rocks_it->key(), cache_it->first) <= 0) {
+               rocks_it->Next();
+               check(rocks_it->status(), "next: ");
+               view.fill_cache(rocks_it->key(), rocks_it->value());
+            }
+            ++cache_it;
+         }
          if (compare_blob(cache_it->first, next_prefix) >= 0)
             cache_it = view.cache.end();
+         else
+            cache_it_num_erases = cache_it->second.num_erases;
       }
 
       std::optional<key_value> get_kv() {
          if (cache_it == view.cache.end())
             return {};
-         if (!cache_it->second.current_value)
+         if (cache_it_num_erases != cache_it->second.num_erases)
             throw exception("kv iterator is at an erased value");
          return key_value{ rocksdb::Slice{ cache_it->first.data() + hidden_prefix_size,
                                            cache_it->first.size() - hidden_prefix_size },
@@ -256,13 +280,13 @@ class view {
 
       bool is_end() { return cache_it == view.cache.end(); }
 
-      bool is_valid() { return cache_it != view.cache.end() && cache_it->second.current_value; }
+      bool is_valid() { return cache_it != view.cache.end() && cache_it_num_erases == cache_it->second.num_erases; }
 
       iterator_impl& operator++() {
          if (cache_it == view.cache.end()) {
             move_to_begin();
             return *this;
-         } else if (!cache_it->second.current_value)
+         } else if (cache_it_num_erases != cache_it->second.num_erases)
             throw exception("kv iterator is at an erased value");
          do {
             while (compare_blob(rocks_it->key(), cache_it->first) <= 0) {
@@ -274,6 +298,8 @@ class view {
          } while (!cache_it->second.current_value);
          if (compare_blob(cache_it->first, next_prefix) >= 0)
             cache_it = view.cache.end();
+         else
+            cache_it_num_erases = cache_it->second.num_erases;
          return *this;
       }
 
@@ -282,7 +308,7 @@ class view {
             rocks_it->Seek(to_slice(next_prefix));
             check(rocks_it->status(), "seek: ");
             cache_it = view.fill_cache(rocks_it->key(), rocks_it->value());
-         } else if (!cache_it->second.current_value)
+         } else if (cache_it_num_erases != cache_it->second.num_erases)
             throw exception("kv iterator is at an erased value");
          do {
             while (compare_blob(rocks_it->key(), cache_it->first) >= 0) {
@@ -294,6 +320,8 @@ class view {
          } while (!cache_it->second.current_value);
          if (compare_blob(cache_it->first, prefix) < 0)
             cache_it = view.cache.end();
+         else
+            cache_it_num_erases = cache_it->second.num_erases;
          return *this;
       }
    }; // iterator_impl
@@ -408,14 +436,15 @@ class view {
    void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
       auto prefixed = prefix_key(prefix, contract, k);
       check(write_batch.Put(to_slice(prefixed), v), "set: ");
-      cache[prefixed] = { bytes{ v.data(), v.data() + v.size() } };
+      cache[prefixed].current_value = bytes{ v.data(), v.data() + v.size() };
    }
 
    void erase(uint64_t contract, const rocksdb::Slice& k) {
-      // !!! iterator invalidation rule change
       auto prefixed = prefix_key(prefix, contract, k);
       check(write_batch.Delete(to_slice(prefixed)), "erase: ");
-      cache[prefixed] = { std::nullopt };
+      auto& cached = cache[prefixed];
+      ++cached.num_erases;
+      cached.current_value = { std::nullopt };
    }
 }; // view
 
