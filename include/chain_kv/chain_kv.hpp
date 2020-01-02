@@ -28,7 +28,13 @@ inline void check(rocksdb::Status s, const char* prefix) {
       throw exception(prefix + s.ToString());
 }
 
-inline rocksdb::Slice to_slice(const std::vector<char>& v) { return { v.data(), v.size() }; }
+using bytes = std::vector<char>;
+
+inline rocksdb::Slice to_slice(const bytes& v) { return { v.data(), v.size() }; }
+
+inline std::shared_ptr<bytes> to_shared_bytes(const rocksdb::Slice& v) {
+   return std::make_shared<bytes>(v.data(), v.data() + v.size());
+}
 
 template <typename A, typename B>
 inline int compare_blob(const A& a, const B& b) {
@@ -45,8 +51,6 @@ inline int compare_blob(const A& a, const B& b) {
       return 1;
    return 0;
 }
-
-using bytes = std::vector<char>;
 
 struct less_blob {
    using is_transparent = void;
@@ -148,6 +152,7 @@ struct key_value {
 };
 
 inline int compare_key(const std::optional<key_value>& a, const std::optional<key_value>& b) {
+   // nullopt represents end; everything else is before end
    if (!a && !b)
       return 0;
    else if (!a && b)
@@ -158,9 +163,24 @@ inline int compare_key(const std::optional<key_value>& a, const std::optional<ke
       return compare_blob(a->key, b->key);
 }
 
+inline int compare_value(const std::shared_ptr<const bytes>& a, const std::shared_ptr<const bytes>& b) {
+   // nullptr represents erased; everything else is after erased
+   if (!a && !b)
+      return 0;
+   else if (!a && b)
+      return -1;
+   else if (a && !b)
+      return 1;
+   else
+      return compare_blob(*a, *b);
+}
+
 struct cached_value {
-   uint64_t             num_erases    = 0;
-   std::optional<bytes> current_value = {};
+   uint64_t                     num_erases       = 0;
+   std::shared_ptr<const bytes> orig_value       = {};
+   std::shared_ptr<const bytes> current_value    = {};
+   bool                         in_change_list   = false;
+   cached_value*                change_list_next = nullptr;
 };
 
 using cache_map = std::map<bytes, cached_value, less_blob>;
@@ -169,19 +189,93 @@ struct write_session {
    database&           db;
    rocksdb::WriteBatch write_batch;
    cache_map           cache;
+   cached_value*       change_list = nullptr;
 
    write_session(database& db) : db{ db } {}
 
+   void changed(cached_value& cached) {
+      if (cached.in_change_list)
+         return;
+      cached.in_change_list   = true;
+      cached.change_list_next = change_list;
+      change_list             = &cached;
+   }
+
+   bool get(bytes&& k, bytes& dest) {
+      auto it = cache.find(k);
+      if (it != cache.end()) {
+         if (it->second.current_value)
+            dest = *it->second.current_value;
+         else
+            dest.clear();
+         return it->second.current_value != nullptr;
+      }
+
+      rocksdb::PinnableSlice v;
+      auto                   stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &v);
+      if (stat.IsNotFound()) {
+         dest.clear();
+         return false;
+      }
+      check(stat, "get: ");
+
+      auto value          = to_shared_bytes(v);
+      cache[std::move(k)] = cached_value{ 0, value, value };
+      dest                = *value;
+      return true;
+   }
+
    void set(bytes&& k, const rocksdb::Slice& v) {
-      check(write_batch.Put(to_slice(k), v), "set: ");
-      cache[std::move(k)].current_value = bytes{ v.data(), v.data() + v.size() };
+      auto it = cache.find(k);
+      if (it != cache.end()) {
+         if (!it->second.current_value || compare_blob(*it->second.current_value, v)) {
+            check(write_batch.Put(to_slice(k), v), "set: ");
+            it->second.current_value = to_shared_bytes(v);
+            changed(it->second);
+         }
+         return;
+      }
+
+      rocksdb::PinnableSlice orig_v;
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
+      if (stat.IsNotFound()) {
+         check(write_batch.Put(to_slice(k), v), "set: ");
+         changed(cache[std::move(k)] = cached_value{ 0, nullptr, to_shared_bytes(v) });
+         return;
+      }
+
+      check(stat, "get: ");
+      if (compare_blob(v, orig_v)) {
+         check(write_batch.Put(to_slice(k), v), "set: ");
+         changed(cache[std::move(k)] = cached_value{ 0, to_shared_bytes(orig_v), to_shared_bytes(v) });
+      } else {
+         auto value          = to_shared_bytes(orig_v);
+         cache[std::move(k)] = cached_value{ 0, value, value };
+      }
    }
 
    void erase(bytes&& k) {
+      auto it = cache.find(k);
+      if (it != cache.end()) {
+         if (it->second.current_value) {
+            check(write_batch.Delete(to_slice(k)), "erase: ");
+            ++it->second.num_erases;
+            it->second.current_value = nullptr;
+            changed(it->second);
+         }
+         return;
+      }
+
+      rocksdb::PinnableSlice orig_v;
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
+      if (stat.IsNotFound()) {
+         cache[std::move(k)] = cached_value{ 0, nullptr, nullptr };
+         return;
+      }
+
+      check(stat, "get: ");
       check(write_batch.Delete(to_slice(k)), "erase: ");
-      auto& cached = cache[std::move(k)];
-      ++cached.num_erases;
-      cached.current_value = { std::nullopt };
+      changed(cache[std::move(k)] = cached_value{ 1, to_shared_bytes(orig_v), nullptr });
    }
 
    cache_map::iterator fill_cache(const rocksdb::Slice& k, const rocksdb::Slice& v) {
@@ -190,9 +284,9 @@ struct write_session {
       it = cache.find(k);
       if (it != cache.end())
          return it;
-      std::tie(it, b) =
-            cache.insert(cache_map::value_type{ bytes{ k.data(), k.data() + k.size() }, //
-                                                cached_value{ 0, bytes{ v.data(), v.data() + v.size() } } });
+      auto value      = to_shared_bytes(v);
+      std::tie(it, b) = cache.insert(
+            cache_map::value_type{ bytes{ k.data(), k.data() + k.size() }, cached_value{ 0, value, value } });
       return it;
    }
 
@@ -434,28 +528,7 @@ class view {
    }
 
    bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
-      auto prefixed = prefix_key(prefix, contract, k);
-
-      auto it = write_session.cache.find(prefixed);
-      if (it != write_session.cache.end()) {
-         if (it->second.current_value)
-            dest = *it->second.current_value;
-         else
-            dest.clear();
-         return it->second.current_value.has_value();
-      }
-
-      rocksdb::PinnableSlice v;
-      auto stat = write_session.db.rdb->Get(rocksdb::ReadOptions(), write_session.db.rdb->DefaultColumnFamily(),
-                                            to_slice(prefixed), &v);
-      if (stat.IsNotFound()) {
-         dest.clear();
-         return false;
-      }
-      check(stat, "get: ");
-      dest.assign(v.data(), v.data() + v.size());
-      write_session.cache[prefixed].current_value = dest;
-      return true;
+      return write_session.get(prefix_key(prefix, contract, k), dest);
    }
 
    void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
