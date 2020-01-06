@@ -1,7 +1,6 @@
-// copyright defined in LICENSE
-
 #pragma once
 
+#include <fc/io/raw.hpp>
 #include <optional>
 #include <rocksdb/db.h>
 #include <rocksdb/table.h>
@@ -34,6 +33,15 @@ inline rocksdb::Slice to_slice(const bytes& v) { return { v.data(), v.size() }; 
 
 inline std::shared_ptr<bytes> to_shared_bytes(const rocksdb::Slice& v) {
    return std::make_shared<bytes>(v.data(), v.data() + v.size());
+}
+
+template <typename Stream>
+void pack_bytes(Stream& s, const bytes& b) {
+   fc::unsigned_int size(b.size());
+   if (size.value != b.size())
+      throw exception("bytes is too big");
+   fc::raw::pack(s, size);
+   s.write(b.data(), b.size());
 }
 
 template <typename A, typename B>
@@ -70,7 +78,7 @@ auto append_key(bytes& dest, T value) -> std::enable_if_t<std::is_unsigned_v<T>,
 }
 
 template <typename T>
-bytes prefix_key(const bytes& prefix, uint64_t contract, const T& key) {
+bytes create_full_key(const bytes& prefix, uint64_t contract, const T& key) {
    bytes result;
    result.reserve(prefix.size() + sizeof(contract) + key.size());
    result.insert(result.end(), prefix.begin(), prefix.end());
@@ -175,30 +183,132 @@ inline int compare_value(const std::shared_ptr<const bytes>& a, const std::share
       return compare_blob(*a, *b);
 }
 
+using cache_map = std::map<bytes, struct cached_value, less_blob>;
+
 struct cached_value {
    uint64_t                     num_erases       = 0;
    std::shared_ptr<const bytes> orig_value       = {};
    std::shared_ptr<const bytes> current_value    = {};
    bool                         in_change_list   = false;
-   cached_value*                change_list_next = nullptr;
+   cache_map::iterator          change_list_next = {};
 };
 
-using cache_map = std::map<bytes, cached_value, less_blob>;
+struct undo_state {
+   uint8_t               format_version    = 0;
+   uint64_t              revision          = 0;
+   std::vector<uint64_t> undo_stack        = {}; // Number of undo segments needed to go back each revision
+   uint64_t              next_undo_segment = 0;
+};
+
+enum class undo_type : uint8_t {
+   remove = 0,
+   put    = 1,
+};
+
+template <typename Stream>
+void pack_remove(Stream& s, const bytes& key) {
+   s << uint8_t(undo_type::remove);
+   pack_bytes(s, key);
+}
+
+template <typename Stream>
+void pack_put(Stream& s, const bytes& key, const bytes& value) {
+   s << uint8_t(undo_type::put);
+   pack_bytes(s, key);
+   pack_bytes(s, value);
+}
+
+struct undoer {
+   database&  db;
+   bytes      undo_prefix;
+   uint64_t   target_segment_size = 64 * 1024 * 1024;
+   undo_state state;
+
+   undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
+      if (undo_prefix.empty())
+         throw exception("undo_prefix is empty");
+      rocksdb::PinnableSlice v;
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(undo_prefix), &v);
+      if (!stat.IsNotFound())
+         check(stat, "get: ");
+      if (stat.ok()) {
+         auto format_version = fc::raw::unpack<uint8_t>(v.data(), v.size());
+         if (format_version)
+            throw exception("invalid undo format");
+         state = fc::raw::unpack<undo_state>(v.data(), v.size());
+      }
+   }
+
+   void write_state(rocksdb::WriteBatch& batch) {
+      check(batch.Put(to_slice(undo_prefix), to_slice(fc::raw::pack(state))), "set: ");
+   }
+
+   void write_changes(cache_map& cache, cache_map::iterator change_list) {
+      rocksdb::WriteBatch batch;
+      bytes               segment;
+      segment.reserve(target_segment_size);
+
+      auto write_segment = [&] {
+         if (segment.empty())
+            return;
+         bytes key;
+         key.reserve(undo_prefix.size() + sizeof(state.next_undo_segment));
+         key.insert(key.end(), undo_prefix.begin(), undo_prefix.end());
+         append_key(key, state.next_undo_segment++);
+         check(batch.Put(to_slice(key), to_slice(segment)), "set: ");
+         segment.clear();
+      };
+
+      auto append_segment = [&](auto f) {
+         fc::datastream<size_t> size_stream;
+         f(size_stream);
+         if (segment.size() + size_stream.tellp() > target_segment_size)
+            write_segment();
+         auto orig_size = segment.size();
+         segment.resize(segment.size() + size_stream.tellp());
+         fc::datastream<char*> ds(segment.data() + orig_size, size_stream.tellp());
+         f(ds);
+      };
+
+      auto it = change_list;
+      while (it != cache.end()) {
+         if (compare_value(it->second.orig_value, it->second.current_value)) {
+            if (it->second.current_value)
+               check(batch.Put(to_slice(it->first), to_slice(*it->second.current_value)), "set: ");
+            else
+               check(batch.Delete(to_slice(it->first)), "erase: ");
+
+            bool first_in_segment = segment.empty();
+            if (!state.undo_stack.empty()) {
+               if (it->second.orig_value) {
+                  append_segment([&](auto& stream) { pack_put(stream, it->first, *it->second.orig_value); });
+               } else {
+                  append_segment([&](auto& stream) { pack_remove(stream, it->first); });
+               }
+            }
+         }
+         it = it->second.change_list_next;
+      }
+
+      write_segment();
+      write_state(batch);
+      db.write(batch);
+   } // write()
+};   // undoer
 
 struct write_session {
    database&           db;
-   rocksdb::WriteBatch write_batch;
    cache_map           cache;
-   cached_value*       change_list = nullptr;
+   cache_map::iterator change_list = cache.end();
 
    write_session(database& db) : db{ db } {}
 
-   void changed(cached_value& cached) {
-      if (cached.in_change_list)
+   void changed(cache_map::iterator it) {
+      if (it->second.in_change_list)
          return;
-      cached.in_change_list   = true;
-      cached.change_list_next = change_list;
-      change_list             = &cached;
+      it->second.in_change_list   = true;
+      it->second.change_list_next = change_list;
+      change_list                 = it;
    }
 
    bool get(bytes&& k, bytes& dest) {
@@ -229,9 +339,8 @@ struct write_session {
       auto it = cache.find(k);
       if (it != cache.end()) {
          if (!it->second.current_value || compare_blob(*it->second.current_value, v)) {
-            check(write_batch.Put(to_slice(k), v), "set: ");
             it->second.current_value = to_shared_bytes(v);
-            changed(it->second);
+            changed(it);
          }
          return;
       }
@@ -239,15 +348,17 @@ struct write_session {
       rocksdb::PinnableSlice orig_v;
       auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
       if (stat.IsNotFound()) {
-         check(write_batch.Put(to_slice(k), v), "set: ");
-         changed(cache[std::move(k)] = cached_value{ 0, nullptr, to_shared_bytes(v) });
+         auto [it, b] =
+               cache.insert(cache_map::value_type{ std::move(k), cached_value{ 0, nullptr, to_shared_bytes(v) } });
+         changed(it);
          return;
       }
 
       check(stat, "get: ");
       if (compare_blob(v, orig_v)) {
-         check(write_batch.Put(to_slice(k), v), "set: ");
-         changed(cache[std::move(k)] = cached_value{ 0, to_shared_bytes(orig_v), to_shared_bytes(v) });
+         auto [it, b] = cache.insert(
+               cache_map::value_type{ std::move(k), cached_value{ 0, to_shared_bytes(orig_v), to_shared_bytes(v) } });
+         changed(it);
       } else {
          auto value          = to_shared_bytes(orig_v);
          cache[std::move(k)] = cached_value{ 0, value, value };
@@ -255,15 +366,16 @@ struct write_session {
    }
 
    void erase(bytes&& k) {
-      auto it = cache.find(k);
-      if (it != cache.end()) {
-         if (it->second.current_value) {
-            check(write_batch.Delete(to_slice(k)), "erase: ");
-            ++it->second.num_erases;
-            it->second.current_value = nullptr;
-            changed(it->second);
+      {
+         auto it = cache.find(k);
+         if (it != cache.end()) {
+            if (it->second.current_value) {
+               ++it->second.num_erases;
+               it->second.current_value = nullptr;
+               changed(it);
+            }
+            return;
          }
-         return;
       }
 
       rocksdb::PinnableSlice orig_v;
@@ -274,8 +386,9 @@ struct write_session {
       }
 
       check(stat, "get: ");
-      check(write_batch.Delete(to_slice(k)), "erase: ");
-      changed(cache[std::move(k)] = cached_value{ 1, to_shared_bytes(orig_v), nullptr });
+      auto [it, b] =
+            cache.insert(cache_map::value_type{ std::move(k), cached_value{ 1, to_shared_bytes(orig_v), nullptr } });
+      changed(it);
    }
 
    cache_map::iterator fill_cache(const rocksdb::Slice& k, const rocksdb::Slice& v) {
@@ -290,8 +403,8 @@ struct write_session {
       return it;
    }
 
-   void write_changes() { db.write(write_batch); }
-};
+   void write_changes(undoer& u) { u.write_changes(cache, change_list); }
+}; // write_session
 
 class view {
  public:
@@ -315,7 +428,7 @@ class view {
 
       iterator_impl(chain_kv::view& view, uint64_t contract, const rocksdb::Slice& prefix)
           : view{ view },                                                              //
-            prefix{ prefix_key(view.prefix, contract, prefix) },                       //
+            prefix{ create_full_key(view.prefix, contract, prefix) },                  //
             hidden_prefix_size{ view.prefix.size() + sizeof(contract) },               //
             rocks_it{ view.write_session.db.rdb->NewIterator(rocksdb::ReadOptions()) } //
       {
@@ -528,14 +641,16 @@ class view {
    }
 
    bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
-      return write_session.get(prefix_key(prefix, contract, k), dest);
+      return write_session.get(create_full_key(prefix, contract, k), dest);
    }
 
    void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
-      write_session.set(prefix_key(prefix, contract, k), v);
+      write_session.set(create_full_key(prefix, contract, k), v);
    }
 
-   void erase(uint64_t contract, const rocksdb::Slice& k) { write_session.erase(prefix_key(prefix, contract, k)); }
+   void erase(uint64_t contract, const rocksdb::Slice& k) { write_session.erase(create_full_key(prefix, contract, k)); }
 }; // view
 
 } // namespace chain_kv
+
+FC_REFLECT(chain_kv::undo_state, (format_version)(revision)(undo_stack)(next_undo_segment))
