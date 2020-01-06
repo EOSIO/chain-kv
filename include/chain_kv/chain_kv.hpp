@@ -44,6 +44,17 @@ void pack_bytes(Stream& s, const bytes& b) {
    s.write(b.data(), b.size());
 }
 
+template <typename Stream>
+std::pair<const char*, size_t> get_bytes(Stream& s) {
+   fc::unsigned_int size;
+   fc::raw::unpack(s, size);
+   if (size > s.remaining())
+      throw exception("bad size for bytes");
+   auto data = s.pos();
+   s.skip(size);
+   return { data, size.value };
+}
+
 template <typename A, typename B>
 inline int compare_blob(const A& a, const B& b) {
    static_assert(std::is_same_v<std::decay_t<decltype(*a.data())>, char> ||
@@ -195,7 +206,7 @@ struct cached_value {
 
 struct undo_state {
    uint8_t               format_version    = 0;
-   uint64_t              revision          = 0;
+   int64_t               revision          = 0;
    std::vector<uint64_t> undo_stack        = {}; // Number of undo segments needed to go back each revision
    uint64_t              next_undo_segment = 0;
 };
@@ -225,10 +236,10 @@ struct undoer {
    undo_state state;
 
    undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
-      if (undo_prefix.empty())
+      if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
       rocksdb::PinnableSlice v;
-      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(undo_prefix), &v);
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->undo_prefix), &v);
       if (!stat.IsNotFound())
          check(stat, "get: ");
       if (stat.ok()) {
@@ -239,8 +250,100 @@ struct undoer {
       }
    }
 
+   // Create a new entry on the undo stack
+   void push() {
+      state.undo_stack.push_back(0);
+      ++state.revision;
+      write_state();
+   }
+
+   // Combine the top two states on the undo stack
+   void squash() {
+      if (state.undo_stack.size() < 2)
+         throw exception("nothing to squash");
+      auto n = state.undo_stack.back();
+      state.undo_stack.pop_back();
+      state.undo_stack.back() += n;
+      --state.revision;
+      write_state();
+   }
+
+   // Reset the contents to the state at the top of the undo stack.
+   void undo() {
+      rocksdb::WriteBatch batch;
+      if (state.undo_stack.empty())
+         throw exception("nothing to undo");
+      auto key = create_segment_key(state.next_undo_segment - state.undo_stack.back());
+
+      std::unique_ptr<rocksdb::Iterator> rocks_it{ db.rdb->NewIterator(rocksdb::ReadOptions()) };
+      rocks_it->Seek(to_slice(key));
+      while (rocks_it->Valid()) {
+         auto segment_key = rocks_it->key();
+         if (segment_key.size() < undo_prefix.size() ||
+             memcmp(segment_key.data(), undo_prefix.data(), undo_prefix.size()))
+            break;
+         auto                        segment = rocks_it->value();
+         fc::datastream<const char*> ds(segment.data(), segment.size());
+         while (ds.remaining()) {
+            uint8_t type;
+            fc::raw::unpack(ds, type);
+            if (type == (uint8_t)undo_type::remove) {
+               auto [key, key_size] = get_bytes(ds);
+               check(batch.Delete({ key, key_size }), "erase: ");
+            } else if (type == (uint8_t)undo_type::put) {
+               auto [key, key_size]     = get_bytes(ds);
+               auto [value, value_size] = get_bytes(ds);
+               check(batch.Put({ key, key_size }, { value, value_size }), "set: ");
+            } else {
+               throw exception("unknown undo_type");
+            }
+         }
+         check(batch.Delete(segment_key), "erase: ");
+         rocks_it->Next();
+      }
+      if (!rocks_it->status().IsNotFound())
+         check(rocks_it->status(), "iterate");
+
+      state.next_undo_segment -= state.undo_stack.back();
+      state.undo_stack.pop_back();
+      write_state(batch);
+      db.write(batch);
+   }
+
+   // Discard all undo history prior to revision
+   void commit(int64_t revision) {
+      revision            = std::min(revision, state.revision);
+      auto first_revision = state.revision - state.undo_stack.size();
+      if (first_revision < revision) {
+         rocksdb::WriteBatch batch;
+         state.undo_stack.erase(state.undo_stack.begin(), state.undo_stack.begin() + (revision - first_revision));
+         uint64_t keep_undo_segment = state.next_undo_segment;
+         for (auto n : state.undo_stack) //
+            keep_undo_segment -= n;
+         if (keep_undo_segment > 0)
+            check(batch.DeleteRange(to_slice(undo_prefix), to_slice(create_segment_key(keep_undo_segment - 1))),
+                  "delete range:");
+         write_state(batch);
+         db.write(batch);
+      }
+   }
+
    void write_state(rocksdb::WriteBatch& batch) {
       check(batch.Put(to_slice(undo_prefix), to_slice(fc::raw::pack(state))), "set: ");
+   }
+
+   void write_state() {
+      rocksdb::WriteBatch batch;
+      write_state(batch);
+      db.write(batch);
+   }
+
+   bytes create_segment_key(uint64_t segment) {
+      bytes key;
+      key.reserve(undo_prefix.size() + sizeof(segment));
+      key.insert(key.end(), undo_prefix.begin(), undo_prefix.end());
+      append_key(key, segment);
+      return key;
    }
 
    void write_changes(cache_map& cache, cache_map::iterator change_list) {
@@ -251,11 +354,9 @@ struct undoer {
       auto write_segment = [&] {
          if (segment.empty())
             return;
-         bytes key;
-         key.reserve(undo_prefix.size() + sizeof(state.next_undo_segment));
-         key.insert(key.end(), undo_prefix.begin(), undo_prefix.end());
-         append_key(key, state.next_undo_segment++);
+         auto key = create_segment_key(state.next_undo_segment++);
          check(batch.Put(to_slice(key), to_slice(segment)), "set: ");
+         ++state.undo_stack.back();
          segment.clear();
       };
 
