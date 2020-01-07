@@ -55,18 +55,56 @@ void undo_tests(bool reload_undoer) {
                                                     { { 0x20, 0x03 }, { 0x60 } },
                                               } }));
 
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
    reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   KV_REQUIRE_EXCEPTION(undoer->set_revision(2), "cannot set revision while there is an existing undo stack");
    undoer->undo();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
    reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
+   undoer->set_revision(10);
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 10);
+   reload();
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 10);
 
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, {} },
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x03 }, { 0x60 } },
                                               } }));
+
+   {
+      chain_kv::write_session session{ db };
+      session.erase({ 0x20, 0x01 });
+      session.set({ 0x20, 0x00 }, to_slice({ 0x70 }));
+      session.write_changes(*undoer);
+   }
+   reload();
+   undoer->push();
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   reload();
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   KV_REQUIRE_EXCEPTION(undoer->set_revision(12), "cannot set revision while there is an existing undo stack");
+   KV_REQUIRE_EXCEPTION(undoer->squash(), "nothing to squash");
+   undoer->commit(0);
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   KV_REQUIRE_EXCEPTION(undoer->set_revision(12), "cannot set revision while there is an existing undo stack");
+   KV_REQUIRE_EXCEPTION(undoer->squash(), "nothing to squash");
+   undoer->commit(11);
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   reload();
+   KV_REQUIRE_EXCEPTION(undoer->set_revision(9), "revision cannot decrease");
+   undoer->set_revision(12);
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 12);
+   reload();
+   BOOST_REQUIRE_EQUAL(undoer->revision(), 12);
+
+   BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
+                                                    { { 0x20, 0x00 }, { 0x70 } },
+                                                    { { 0x20, 0x03 }, { 0x60 } },
+                                              } }));
+
 } // undo_tests()
 
 BOOST_AUTO_TEST_CASE(test_undo) {

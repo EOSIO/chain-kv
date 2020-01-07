@@ -262,6 +262,7 @@ struct undoer {
       if (revision < state.revision)
          throw exception("revision cannot decrease");
       state.revision = revision;
+      write_state();
    }
 
    // Create a new entry on the undo stack
