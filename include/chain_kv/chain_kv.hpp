@@ -80,6 +80,17 @@ struct less_blob {
    }
 };
 
+bytes get_next_prefix(const bytes& prefix) {
+   bytes next_prefix;
+   next_prefix = prefix;
+   while (!next_prefix.empty()) {
+      if (++next_prefix.back())
+         break;
+      next_prefix.pop_back();
+   }
+   return next_prefix;
+}
+
 template <typename T>
 auto append_key(bytes& dest, T value) -> std::enable_if_t<std::is_unsigned_v<T>, void> {
    char buf[sizeof(value)];
@@ -231,17 +242,29 @@ void pack_put(Stream& s, const bytes& key, const bytes& value) {
 struct undoer {
    database&  db;
    bytes      undo_prefix;
+   bytes      state_prefix;
    bytes      segment_prefix;
+   bytes      segment_next_prefix;
    uint64_t   target_segment_size = 64 * 1024 * 1024;
    undo_state state;
 
    undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
+
+      // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
+      // invalid during iteration.
+      if (this->undo_prefix[0] == 0x00 || this->undo_prefix[0] == (char)0xff)
+         throw exception("undoer may not have a prefix which begins with 0x00 or 0xff");
+
+      state_prefix = this->undo_prefix;
+      state_prefix.push_back(0x00);
       segment_prefix = this->undo_prefix;
       segment_prefix.push_back(0x80);
+      segment_next_prefix = get_next_prefix(segment_prefix);
+
       rocksdb::PinnableSlice v;
-      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->undo_prefix), &v);
+      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->state_prefix), &v);
       if (!stat.IsNotFound())
          check(stat, "get: ");
       if (stat.ok()) {
@@ -283,19 +306,21 @@ struct undoer {
       write_state();
    }
 
-   // Reset the contents to the state at the top of the undo stack.
+   // Reset the contents to the state at the top of the undo stack
    void undo() {
       if (state.undo_stack.empty())
          throw exception("nothing to undo");
       rocksdb::WriteBatch batch;
 
       std::unique_ptr<rocksdb::Iterator> rocks_it{ db.rdb->NewIterator(rocksdb::ReadOptions()) };
-      rocks_it->Seek(to_slice(create_segment_key(state.next_undo_segment - state.undo_stack.back())));
+      auto                               first = create_segment_key(state.next_undo_segment - state.undo_stack.back());
+      rocks_it->Seek(to_slice(segment_next_prefix));
+      if (rocks_it->Valid())
+         rocks_it->Prev();
 
       while (rocks_it->Valid()) {
          auto segment_key = rocks_it->key();
-         if (segment_key.size() < segment_prefix.size() ||
-             memcmp(segment_key.data(), segment_prefix.data(), segment_prefix.size()))
+         if (compare_blob(segment_key, first) < 0)
             break;
          auto                        segment = rocks_it->value();
          fc::datastream<const char*> ds(segment.data(), segment.size());
@@ -314,10 +339,9 @@ struct undoer {
             }
          }
          check(batch.Delete(segment_key), "erase: ");
-         rocks_it->Next();
+         rocks_it->Prev();
       }
-      if (!rocks_it->status().IsNotFound())
-         check(rocks_it->status(), "iterate: ");
+      check(rocks_it->status(), "iterate: ");
 
       state.next_undo_segment -= state.undo_stack.back();
       state.undo_stack.pop_back();
@@ -346,7 +370,7 @@ struct undoer {
    }
 
    void write_state(rocksdb::WriteBatch& batch) {
-      check(batch.Put(to_slice(undo_prefix), to_slice(fc::raw::pack(state))), "set: ");
+      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))), "set: ");
    }
 
    void write_state() {
@@ -550,12 +574,7 @@ class view {
             hidden_prefix_size{ view.prefix.size() + sizeof(contract) },               //
             rocks_it{ view.write_session.db.rdb->NewIterator(rocksdb::ReadOptions()) } //
       {
-         next_prefix = this->prefix;
-         while (!next_prefix.empty()) {
-            if (++next_prefix.back())
-               break;
-            next_prefix.pop_back();
-         }
+         next_prefix = get_next_prefix(this->prefix);
 
          rocks_it->Seek(to_slice(this->prefix));
          check(rocks_it->status(), "seek: ");
@@ -753,7 +772,7 @@ class view {
          throw exception("kv view may not have empty prefix");
 
       // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
-      // invalid during iteration.
+      // invalid during iteration. This also allows get_next_prefix() to function correctly.
       if (this->prefix[0] == 0x00 || this->prefix[0] == (char)0xff)
          throw exception("view may not have a prefix which begins with 0x00 or 0xff");
    }
