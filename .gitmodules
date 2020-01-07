@@ -1,0 +1,3 @@
+[submodule "external/fc"]
+	path = external/fc
+	url = https://github.com/EOSIO/fc.git

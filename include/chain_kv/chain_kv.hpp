@@ -101,8 +101,9 @@ bytes create_full_key(const bytes& prefix, uint64_t contract, const T& key) {
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
-   database(const char* db_path, bool create_if_missing, std::optional<uint32_t> threads,
-            std::optional<uint32_t> max_open_files) {
+   database(const char* db_path, bool create_if_missing, std::optional<uint32_t> threads = {},
+            std::optional<uint32_t> max_open_files = {}) {
+
       rocksdb::Options options;
       options.create_if_missing                    = create_if_missing;
       options.level_compaction_dynamic_level_bytes = true;
@@ -112,8 +113,6 @@ struct database {
          options.IncreaseParallelism(*threads);
 
       options.OptimizeLevelStyleCompaction(256ull << 20);
-      for (auto& x : options.compression_per_level) // todo: fix snappy build
-         x = rocksdb::kNoCompression;
 
       if (max_open_files)
          options.max_open_files = *max_open_files;
@@ -251,6 +250,18 @@ struct undoer {
             throw exception("invalid undo format");
          state = fc::raw::unpack<undo_state>(v.data(), v.size());
       }
+   }
+
+   int64_t revision() const { return state.revision; }
+
+   void set_revision(uint64_t revision) {
+      if (state.undo_stack.size() != 0)
+         throw exception("cannot set revision while there is an existing undo stack");
+      if (revision > std::numeric_limits<int64_t>::max())
+         throw exception("revision to set is too high");
+      if (revision < state.revision)
+         throw exception("revision cannot decrease");
+      state.revision = revision;
    }
 
    // Create a new entry on the undo stack
