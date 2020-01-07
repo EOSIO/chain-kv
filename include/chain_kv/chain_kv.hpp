@@ -232,12 +232,15 @@ void pack_put(Stream& s, const bytes& key, const bytes& value) {
 struct undoer {
    database&  db;
    bytes      undo_prefix;
+   bytes      segment_prefix;
    uint64_t   target_segment_size = 64 * 1024 * 1024;
    undo_state state;
 
    undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
+      segment_prefix = undo_prefix;
+      segment_prefix.push_back(0x80);
       rocksdb::PinnableSlice v;
       auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->undo_prefix), &v);
       if (!stat.IsNotFound())
@@ -270,17 +273,17 @@ struct undoer {
 
    // Reset the contents to the state at the top of the undo stack.
    void undo() {
-      rocksdb::WriteBatch batch;
       if (state.undo_stack.empty())
          throw exception("nothing to undo");
-      auto key = create_segment_key(state.next_undo_segment - state.undo_stack.back());
+      rocksdb::WriteBatch batch;
 
       std::unique_ptr<rocksdb::Iterator> rocks_it{ db.rdb->NewIterator(rocksdb::ReadOptions()) };
-      rocks_it->Seek(to_slice(key));
+      rocks_it->Seek(to_slice(create_segment_key(state.next_undo_segment - state.undo_stack.back())));
+
       while (rocks_it->Valid()) {
          auto segment_key = rocks_it->key();
-         if (segment_key.size() < undo_prefix.size() ||
-             memcmp(segment_key.data(), undo_prefix.data(), undo_prefix.size()))
+         if (segment_key.size() < segment_prefix.size() ||
+             memcmp(segment_key.data(), segment_prefix.data(), segment_prefix.size()))
             break;
          auto                        segment = rocks_it->value();
          fc::datastream<const char*> ds(segment.data(), segment.size());
@@ -302,10 +305,11 @@ struct undoer {
          rocks_it->Next();
       }
       if (!rocks_it->status().IsNotFound())
-         check(rocks_it->status(), "iterate");
+         check(rocks_it->status(), "iterate: ");
 
       state.next_undo_segment -= state.undo_stack.back();
       state.undo_stack.pop_back();
+      --state.revision;
       write_state(batch);
       db.write(batch);
    }
@@ -321,7 +325,8 @@ struct undoer {
          for (auto n : state.undo_stack) //
             keep_undo_segment -= n;
          if (keep_undo_segment > 0)
-            check(batch.DeleteRange(to_slice(undo_prefix), to_slice(create_segment_key(keep_undo_segment - 1))),
+            check(batch.DeleteRange(to_slice(create_segment_key(0)),
+                                    to_slice(create_segment_key(keep_undo_segment - 1))),
                   "delete range:");
          write_state(batch);
          db.write(batch);
@@ -340,8 +345,8 @@ struct undoer {
 
    bytes create_segment_key(uint64_t segment) {
       bytes key;
-      key.reserve(undo_prefix.size() + sizeof(segment));
-      key.insert(key.end(), undo_prefix.begin(), undo_prefix.end());
+      key.reserve(segment_prefix.size() + sizeof(segment));
+      key.insert(key.end(), segment_prefix.begin(), segment_prefix.end());
       append_key(key, segment);
       return key;
    }
