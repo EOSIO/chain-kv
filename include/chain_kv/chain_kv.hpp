@@ -238,7 +238,7 @@ struct undoer {
    undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
-      segment_prefix = undo_prefix;
+      segment_prefix = this->undo_prefix;
       segment_prefix.push_back(0x80);
       rocksdb::PinnableSlice v;
       auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->undo_prefix), &v);

@@ -31,7 +31,7 @@ void undo_tests(bool reload_undoer) {
    }
    KV_REQUIRE_EXCEPTION(undoer->undo(), "nothing to undo");
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
-
+   BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, {} },
                                                     { { 0x20, 0x01 }, { 0x50 } },
@@ -49,7 +49,7 @@ void undo_tests(bool reload_undoer) {
       session.set({ 0x20, 0x00 }, to_slice({ 0x70 }));
       session.write_changes(*undoer);
    }
-
+   BOOST_REQUIRE_NE(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // has undo segments
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, { 0x70 } },
                                                     { { 0x20, 0x03 }, { 0x60 } },
@@ -60,6 +60,7 @@ void undo_tests(bool reload_undoer) {
    BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
    KV_REQUIRE_EXCEPTION(undoer->set_revision(2), "cannot set revision while there is an existing undo stack");
    undoer->undo();
+   BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
    reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
@@ -80,6 +81,7 @@ void undo_tests(bool reload_undoer) {
       session.set({ 0x20, 0x00 }, to_slice({ 0x70 }));
       session.write_changes(*undoer);
    }
+   BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
    reload();
    undoer->push();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
