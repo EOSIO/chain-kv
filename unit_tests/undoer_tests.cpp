@@ -122,6 +122,7 @@ void squash_tests(bool reload_undoer) {
 
    // set 1
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
    {
       chain_kv::write_session session{ db };
@@ -129,6 +130,7 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x02 }, to_slice({ 0x60 }));
       session.write_changes(*undoer);
    }
+   reload();
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x02 }, { 0x60 } },
@@ -136,6 +138,7 @@ void squash_tests(bool reload_undoer) {
 
    // set 2
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
    {
       chain_kv::write_session session{ db };
@@ -145,7 +148,9 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x04 }, to_slice({ 0x10 }));
       session.write_changes(*undoer);
    }
+   reload();
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
    {
       chain_kv::write_session session{ db };
@@ -156,7 +161,9 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x06 }, to_slice({ 0x06 }));
       session.write_changes(*undoer);
    }
+   reload();
    undoer->squash();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
@@ -168,6 +175,7 @@ void squash_tests(bool reload_undoer) {
 
    // set 3
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
    {
       chain_kv::write_session session{ db };
@@ -175,7 +183,9 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x08 }, to_slice({ 0x08 }));
       session.write_changes(*undoer);
    }
+   reload();
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 4);
    {
       chain_kv::write_session session{ db };
@@ -183,7 +193,9 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x0a }, to_slice({ 0x0a }));
       session.write_changes(*undoer);
    }
+   reload();
    undoer->push();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 5);
    {
       chain_kv::write_session session{ db };
@@ -191,9 +203,12 @@ void squash_tests(bool reload_undoer) {
       session.set({ 0x20, 0x0c }, to_slice({ 0x0c }));
       session.write_changes(*undoer);
    }
+   reload();
    undoer->squash();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 4);
    undoer->squash();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
@@ -211,6 +226,7 @@ void squash_tests(bool reload_undoer) {
 
    // undo set 3
    undoer->undo();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
@@ -222,6 +238,7 @@ void squash_tests(bool reload_undoer) {
 
    // undo set 2
    undoer->undo();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
@@ -230,6 +247,7 @@ void squash_tests(bool reload_undoer) {
 
    // undo set 1
    undoer->undo();
+   reload();
    BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {} }));
 } // squash_tests()
