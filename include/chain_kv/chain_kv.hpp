@@ -674,6 +674,8 @@ class view {
             rocks_it->Seek(to_slice(next_prefix));
             check(rocks_it->status(), "seek: ");
             cache_it = view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
+            if (compare_blob(cache_it->first, to_slice(next_prefix)))
+               cache_it = view.write_session.cache.lower_bound(next_prefix);
          } else if (cache_it_num_erases != cache_it->second.num_erases)
             throw exception("kv iterator is at an erased value");
          do {

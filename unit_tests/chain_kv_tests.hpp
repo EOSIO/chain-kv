@@ -101,3 +101,12 @@ inline kv_values get_matching2(chain_kv::view& view, uint64_t contract, const ch
    std::reverse(result.values.begin(), result.values.end());
    return result;
 }
+
+inline kv_values get_it(const chain_kv::view::iterator& it) {
+   kv_values result;
+   auto      kv = it.get_kv();
+   if (!kv)
+      throw chain_kv::exception("iterator read failure");
+   result.values.push_back({ chain_kv::to_bytes(kv->key), chain_kv::to_bytes(kv->value) });
+   return result;
+}
