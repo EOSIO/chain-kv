@@ -55,7 +55,7 @@ inline kv_values get_all(chain_kv::database& db, const chain_kv::bytes& prefix) 
       if (k.size() < prefix.size() || memcmp(k.data(), prefix.data(), prefix.size()))
          break;
       auto v = rocks_it->value();
-      result.values.push_back({ { k.data(), k.data() + k.size() }, { v.data(), v.data() + v.size() } });
+      result.values.push_back({ chain_kv::to_bytes(k), chain_kv::to_bytes(v) });
       rocks_it->Next();
    }
    if (!rocks_it->status().IsNotFound())
@@ -70,5 +70,34 @@ inline kv_values get_values(chain_kv::write_session& session, const std::vector<
       if (session.get(chain_kv::bytes{ key }, value))
          result.values.push_back({ key, value });
    }
+   return result;
+}
+
+inline kv_values get_matching(chain_kv::view& view, uint64_t contract, const chain_kv::bytes& prefix = {}) {
+   kv_values                result;
+   chain_kv::view::iterator it{ view, contract, chain_kv::to_slice(prefix) };
+   ++it;
+   while (!it.is_end()) {
+      auto kv = it.get_kv();
+      if (!kv)
+         throw chain_kv::exception("iterator read failure");
+      result.values.push_back({ chain_kv::to_bytes(kv->key), chain_kv::to_bytes(kv->value) });
+      ++it;
+   }
+   return result;
+}
+
+inline kv_values get_matching2(chain_kv::view& view, uint64_t contract, const chain_kv::bytes& prefix = {}) {
+   kv_values                result;
+   chain_kv::view::iterator it{ view, contract, chain_kv::to_slice(prefix) };
+   --it;
+   while (!it.is_end()) {
+      auto kv = it.get_kv();
+      if (!kv)
+         throw chain_kv::exception("iterator read failure");
+      result.values.push_back({ chain_kv::to_bytes(kv->key), chain_kv::to_bytes(kv->value) });
+      --it;
+   }
+   std::reverse(result.values.begin(), result.values.end());
    return result;
 }

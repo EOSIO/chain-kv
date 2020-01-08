@@ -31,6 +31,8 @@ using bytes = std::vector<char>;
 
 inline rocksdb::Slice to_slice(const bytes& v) { return { v.data(), v.size() }; }
 
+inline bytes to_bytes(const rocksdb::Slice& v) { return { v.data(), v.data() + v.size() }; }
+
 inline std::shared_ptr<bytes> to_shared_bytes(const rocksdb::Slice& v) {
    return std::make_shared<bytes>(v.data(), v.data() + v.size());
 }
@@ -540,8 +542,7 @@ struct write_session {
       if (it != cache.end())
          return it;
       auto value      = to_shared_bytes(v);
-      std::tie(it, b) = cache.insert(
-            cache_map::value_type{ bytes{ k.data(), k.data() + k.size() }, cached_value{ 0, value, value } });
+      std::tie(it, b) = cache.insert(cache_map::value_type{ to_bytes(k), cached_value{ 0, value, value } });
       return it;
    }
 
