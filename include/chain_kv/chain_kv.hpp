@@ -239,7 +239,7 @@ void pack_put(Stream& s, const bytes& key, const bytes& value) {
    pack_bytes(s, value);
 }
 
-struct undoer {
+struct undo_stack {
    database&  db;
    bytes      undo_prefix;
    bytes      state_prefix;
@@ -248,14 +248,14 @@ struct undoer {
    uint64_t   target_segment_size = 64 * 1024 * 1024;
    undo_state state;
 
-   undoer(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
+   undo_stack(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
 
       // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
       // invalid during iteration.
       if (this->undo_prefix[0] == 0x00 || this->undo_prefix[0] == (char)0xff)
-         throw exception("undoer may not have a prefix which begins with 0x00 or 0xff");
+         throw exception("undo_stack may not have a prefix which begins with 0x00 or 0xff");
 
       state_prefix = this->undo_prefix;
       state_prefix.push_back(0x00);
@@ -436,7 +436,7 @@ struct undoer {
       write_state(batch);
       db.write(batch);
    } // write()
-};   // undoer
+};   // undo_stack
 
 struct write_session {
    database&           db;
@@ -545,7 +545,7 @@ struct write_session {
       return it;
    }
 
-   void write_changes(undoer& u) { u.write_changes(cache, change_list); }
+   void write_changes(undo_stack& u) { u.write_changes(cache, change_list); }
 }; // write_session
 
 class view {

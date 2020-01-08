@@ -6,19 +6,19 @@ using chain_kv::to_slice;
 
 BOOST_AUTO_TEST_SUITE(undoer_tests)
 
-void undo_tests(bool reload_undoer) {
+void undo_tests(bool reload_undo) {
    boost::filesystem::remove_all("test-db");
-   chain_kv::database                db{ "test-db", true };
-   std::unique_ptr<chain_kv::undoer> undoer;
+   chain_kv::database                    db{ "test-db", true };
+   std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
-      if (!undoer || reload_undoer)
-         undoer = std::make_unique<chain_kv::undoer>(db, bytes{ 0x10 });
+      if (!undo_stack || reload_undo)
+         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 });
    };
    reload();
 
-   KV_REQUIRE_EXCEPTION(undoer->undo(), "nothing to undo");
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
+   KV_REQUIRE_EXCEPTION(undo_stack->undo(), "nothing to undo");
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 0);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x00 }, to_slice({}));
@@ -27,10 +27,10 @@ void undo_tests(bool reload_undoer) {
       session.erase({ 0x20, 0x02 });
       session.set({ 0x20, 0x03 }, to_slice({ 0x60 }));
       session.set({ 0x20, 0x01 }, to_slice({ 0x50 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
-   KV_REQUIRE_EXCEPTION(undoer->undo(), "nothing to undo");
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
+   KV_REQUIRE_EXCEPTION(undo_stack->undo(), "nothing to undo");
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 0);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, {} },
@@ -39,15 +39,15 @@ void undo_tests(bool reload_undoer) {
                                               } }));
 
    reload();
-   undoer->push();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   undo_stack->push();
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
    {
       chain_kv::write_session session{ db };
       session.erase({ 0x20, 0x01 });
       session.set({ 0x20, 0x00 }, to_slice({ 0x70 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    BOOST_REQUIRE_NE(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // has undo segments
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
@@ -55,19 +55,19 @@ void undo_tests(bool reload_undoer) {
                                                     { { 0x20, 0x03 }, { 0x60 } },
                                               } }));
 
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
-   KV_REQUIRE_EXCEPTION(undoer->set_revision(2), "cannot set revision while there is an existing undo stack");
-   undoer->undo();
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
+   KV_REQUIRE_EXCEPTION(undo_stack->set_revision(2), "cannot set revision while there is an existing undo stack");
+   undo_stack->undo();
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 0);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
-   undoer->set_revision(10);
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 10);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 0);
+   undo_stack->set_revision(10);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 10);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 10);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 10);
 
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, {} },
@@ -79,28 +79,28 @@ void undo_tests(bool reload_undoer) {
       chain_kv::write_session session{ db };
       session.erase({ 0x20, 0x01 });
       session.set({ 0x20, 0x00 }, to_slice({ 0x70 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x10, (char)0x80 }), (kv_values{})); // no undo segments
    reload();
-   undoer->push();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   undo_stack->push();
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 11);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
-   KV_REQUIRE_EXCEPTION(undoer->set_revision(12), "cannot set revision while there is an existing undo stack");
-   KV_REQUIRE_EXCEPTION(undoer->squash(), "nothing to squash");
-   undoer->commit(0);
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
-   KV_REQUIRE_EXCEPTION(undoer->set_revision(12), "cannot set revision while there is an existing undo stack");
-   KV_REQUIRE_EXCEPTION(undoer->squash(), "nothing to squash");
-   undoer->commit(11);
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 11);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 11);
+   KV_REQUIRE_EXCEPTION(undo_stack->set_revision(12), "cannot set revision while there is an existing undo stack");
+   KV_REQUIRE_EXCEPTION(undo_stack->squash(), "nothing to squash");
+   undo_stack->commit(0);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 11);
+   KV_REQUIRE_EXCEPTION(undo_stack->set_revision(12), "cannot set revision while there is an existing undo stack");
+   KV_REQUIRE_EXCEPTION(undo_stack->squash(), "nothing to squash");
+   undo_stack->commit(11);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 11);
    reload();
-   KV_REQUIRE_EXCEPTION(undoer->set_revision(9), "revision cannot decrease");
-   undoer->set_revision(12);
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 12);
+   KV_REQUIRE_EXCEPTION(undo_stack->set_revision(9), "revision cannot decrease");
+   undo_stack->set_revision(12);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 12);
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 12);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 12);
 
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x00 }, { 0x70 } },
@@ -109,26 +109,26 @@ void undo_tests(bool reload_undoer) {
 
 } // undo_tests()
 
-void squash_tests(bool reload_undoer) {
+void squash_tests(bool reload_undo) {
    boost::filesystem::remove_all("test-db");
-   chain_kv::database                db{ "test-db", true };
-   std::unique_ptr<chain_kv::undoer> undoer;
+   chain_kv::database                    db{ "test-db", true };
+   std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
-      if (!undoer || reload_undoer)
-         undoer = std::make_unique<chain_kv::undoer>(db, bytes{ 0x10 });
+      if (!undo_stack || reload_undo)
+         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 });
    };
    reload();
 
    // set 1
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x01 }, to_slice({ 0x50 }));
       session.set({ 0x20, 0x02 }, to_slice({ 0x60 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
@@ -137,21 +137,21 @@ void squash_tests(bool reload_undoer) {
                                               } }));
 
    // set 2
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 2);
    {
       chain_kv::write_session session{ db };
       session.erase({ 0x20, 0x01 });
       session.set({ 0x20, 0x02 }, to_slice({ 0x61 }));
       session.set({ 0x20, 0x03 }, to_slice({ 0x70 }));
       session.set({ 0x20, 0x04 }, to_slice({ 0x10 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 3);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x01 }, to_slice({ 0x50 }));
@@ -159,12 +159,12 @@ void squash_tests(bool reload_undoer) {
       session.erase({ 0x20, 0x03 });
       session.set({ 0x20, 0x05 }, to_slice({ 0x05 }));
       session.set({ 0x20, 0x06 }, to_slice({ 0x06 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
-   undoer->squash();
+   undo_stack->squash();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 2);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x02 }, { 0x62 } },
@@ -174,42 +174,42 @@ void squash_tests(bool reload_undoer) {
                                               } }));
 
    // set 3
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 3);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x07 }, to_slice({ 0x07 }));
       session.set({ 0x20, 0x08 }, to_slice({ 0x08 }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 4);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 4);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x09 }, to_slice({ 0x09 }));
       session.set({ 0x20, 0x0a }, to_slice({ 0x0a }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
-   undoer->push();
+   undo_stack->push();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 5);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 5);
    {
       chain_kv::write_session session{ db };
       session.set({ 0x20, 0x0b }, to_slice({ 0x0b }));
       session.set({ 0x20, 0x0c }, to_slice({ 0x0c }));
-      session.write_changes(*undoer);
+      session.write_changes(*undo_stack);
    }
    reload();
-   undoer->squash();
+   undo_stack->squash();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 4);
-   undoer->squash();
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 4);
+   undo_stack->squash();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 3);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 3);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x02 }, { 0x62 } },
@@ -225,9 +225,9 @@ void squash_tests(bool reload_undoer) {
                                               } }));
 
    // undo set 3
-   undoer->undo();
+   undo_stack->undo();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 2);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 2);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x02 }, { 0x62 } },
@@ -237,18 +237,18 @@ void squash_tests(bool reload_undoer) {
                                               } }));
 
    // undo set 2
-   undoer->undo();
+   undo_stack->undo();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 1);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 1);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {
                                                     { { 0x20, 0x01 }, { 0x50 } },
                                                     { { 0x20, 0x02 }, { 0x60 } },
                                               } }));
 
    // undo set 1
-   undoer->undo();
+   undo_stack->undo();
    reload();
-   BOOST_REQUIRE_EQUAL(undoer->revision(), 0);
+   BOOST_REQUIRE_EQUAL(undo_stack->revision(), 0);
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {} }));
 } // squash_tests()
 
