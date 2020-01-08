@@ -46,7 +46,7 @@ S& operator<<(S& s, const kv_values& v) {
       return false;                                                                                                    \
    });
 
-kv_values get_all(chain_kv::database& db, const chain_kv::bytes& prefix) {
+inline kv_values get_all(chain_kv::database& db, const chain_kv::bytes& prefix) {
    kv_values                          result;
    std::unique_ptr<rocksdb::Iterator> rocks_it{ db.rdb->NewIterator(rocksdb::ReadOptions()) };
    rocks_it->Seek(chain_kv::to_slice(prefix));
@@ -60,5 +60,15 @@ kv_values get_all(chain_kv::database& db, const chain_kv::bytes& prefix) {
    }
    if (!rocks_it->status().IsNotFound())
       chain_kv::check(rocks_it->status(), "iterate: ");
+   return result;
+}
+
+inline kv_values get_values(chain_kv::write_session& session, const std::vector<chain_kv::bytes>& keys) {
+   kv_values result;
+   for (auto& key : keys) {
+      chain_kv::bytes value;
+      if (session.get(chain_kv::bytes{ key }, value))
+         result.values.push_back({ key, value });
+   }
    return result;
 }

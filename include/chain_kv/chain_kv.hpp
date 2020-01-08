@@ -80,7 +80,7 @@ struct less_blob {
    }
 };
 
-bytes get_next_prefix(const bytes& prefix) {
+inline bytes get_next_prefix(const bytes& prefix) {
    bytes next_prefix;
    next_prefix = prefix;
    while (!next_prefix.empty()) {

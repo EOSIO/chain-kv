@@ -7,8 +7,8 @@ using chain_kv::to_slice;
 BOOST_AUTO_TEST_SUITE(undoer_tests)
 
 void undo_tests(bool reload_undo) {
-   boost::filesystem::remove_all("test-db");
-   chain_kv::database                    db{ "test-db", true };
+   boost::filesystem::remove_all("test-undo-db");
+   chain_kv::database                    db{ "test-undo-db", true };
    std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
@@ -110,8 +110,8 @@ void undo_tests(bool reload_undo) {
 } // undo_tests()
 
 void squash_tests(bool reload_undo) {
-   boost::filesystem::remove_all("test-db");
-   chain_kv::database                    db{ "test-db", true };
+   boost::filesystem::remove_all("test-squash-db");
+   chain_kv::database                    db{ "test-squash-db", true };
    std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
