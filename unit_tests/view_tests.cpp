@@ -110,6 +110,56 @@ void view_test(bool reload_session) {
       view->erase(0x5678, to_slice({ 0x30, 0x22 }));
       KV_REQUIRE_EXCEPTION(it.get_kv(), "kv iterator is at an erased value");
    }
+   reload();
+
+   {
+      chain_kv::view::iterator it{ *view, 0xbeefbeef, {} };
+      view->set(0xbeefbeef, to_slice({ (char)0x80 }), to_slice({ (char)0xff }));
+      view->set(0xbeefbeef, to_slice({ (char)0x90 }), to_slice({ (char)0xfe }));
+      view->set(0xbeefbeef, to_slice({ (char)0xa0 }), to_slice({ (char)0xfd }));
+      view->set(0xbeefbeef, to_slice({ (char)0xb0 }), to_slice({ (char)0xfc }));
+      it.lower_bound({});
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x80 }, { (char)0xff } },
+                                      } }));
+      it.lower_bound({ (char)0x80 });
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x80 }, { (char)0xff } },
+                                      } }));
+      it.lower_bound({ (char)0x81 });
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x90 }, { (char)0xfe } },
+                                      } }));
+      it.lower_bound({ (char)0x90 });
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x90 }, { (char)0xfe } },
+                                      } }));
+      --it;
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x80 }, { (char)0xff } },
+                                      } }));
+      ++it;
+      ++it;
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0xa0 }, { (char)0xfd } },
+                                      } }));
+      view->erase(0xbeefbeef, to_slice({ (char)0x90 }));
+      --it;
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0x80 }, { (char)0xff } },
+                                      } }));
+      view->erase(0xbeefbeef, to_slice({ (char)0xa0 }));
+      ++it;
+      BOOST_REQUIRE_EQUAL(get_it(it), (kv_values{ {
+                                            { { (char)0xb0 }, { (char)0xfc } },
+                                      } }));
+   }
+   reload();
+
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xbeefbeef), (kv_values{ {
+                                                              { { (char)0x80 }, { (char)0xff } },
+                                                              { { (char)0xb0 }, { (char)0xfc } },
+                                                        } }));
 
    // !!! iterator prefix tests
 
