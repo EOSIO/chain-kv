@@ -53,7 +53,7 @@ std::pair<const char*, size_t> get_bytes(Stream& s) {
    if (size > s.remaining())
       throw exception("bad size for bytes");
    auto data = s.pos();
-   s.skip(size);
+   s.skip(size.value);
    return { data, size.value };
 }
 
@@ -83,8 +83,7 @@ struct less_blob {
 };
 
 inline bytes get_next_prefix(const bytes& prefix) {
-   bytes next_prefix;
-   next_prefix = prefix;
+   bytes next_prefix = prefix;
    while (!next_prefix.empty()) {
       if (++next_prefix.back())
          break;
@@ -136,7 +135,7 @@ struct database {
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
       rocksdb::DB* p;
-      check(rocksdb::DB::Open(options, db_path, &p), "rocksdb::DB::Open: ");
+      check(rocksdb::DB::Open(options, db_path, &p), "database::database: rocksdb::DB::Open: ");
       rdb.reset(p);
 
       // Sentinels with keys 0x00 and 0xff simplify iteration logic.
@@ -147,10 +146,10 @@ struct database {
          rocksdb::PinnableSlice v;
          auto                   stat = rdb->Get(rocksdb::ReadOptions(), rdb->DefaultColumnFamily(), to_slice(k), &v);
          if (stat.IsNotFound()) {
-            check(batch.Put(to_slice(k), {}), "put: ");
+            check(batch.Put(to_slice(k), {}), "database::database: rocksdb::WriteBatch::Put: ");
             modified = true;
          } else {
-            check(stat, "get: ");
+            check(stat, "database::database: rocksdb::DB::Get: ");
          }
       };
       write_sentinal({ 0x00 });
@@ -172,7 +171,7 @@ struct database {
    void write(rocksdb::WriteBatch& batch) {
       rocksdb::WriteOptions opt;
       opt.disableWAL = true;
-      check(rdb->Write(opt, &batch), "write batch");
+      check(rdb->Write(opt, &batch), "database::write: rocksdb::DB::Write (batch)");
       batch.Clear();
    }
 }; // database
@@ -268,7 +267,7 @@ struct undo_stack {
       rocksdb::PinnableSlice v;
       auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(this->state_prefix), &v);
       if (!stat.IsNotFound())
-         check(stat, "get: ");
+         check(stat, "undo_stack::undo_stack: rocksdb::DB::Get: ");
       if (stat.ok()) {
          auto format_version = fc::raw::unpack<uint8_t>(v.data(), v.size());
          if (format_version)
@@ -331,19 +330,20 @@ struct undo_stack {
             fc::raw::unpack(ds, type);
             if (type == (uint8_t)undo_type::remove) {
                auto [key, key_size] = get_bytes(ds);
-               check(batch.Delete({ key, key_size }), "erase: ");
+               check(batch.Delete({ key, key_size }), "undo_stack::undo: rocksdb::WriteBatch::Delete: ");
             } else if (type == (uint8_t)undo_type::put) {
                auto [key, key_size]     = get_bytes(ds);
                auto [value, value_size] = get_bytes(ds);
-               check(batch.Put({ key, key_size }, { value, value_size }), "set: ");
+               check(batch.Put({ key, key_size }, { value, value_size }),
+                     "undo_stack::undo: rocksdb::WriteBatch::Put: ");
             } else {
                throw exception("unknown undo_type");
             }
          }
-         check(batch.Delete(segment_key), "erase: ");
+         check(batch.Delete(segment_key), "undo_stack::undo: rocksdb::WriteBatch::Delete: ");
          rocks_it->Prev();
       }
-      check(rocks_it->status(), "iterate: ");
+      check(rocks_it->status(), "undo_stack::undo: iterate rocksdb: ");
 
       state.next_undo_segment -= state.undo_stack.back();
       state.undo_stack.pop_back();
@@ -365,14 +365,15 @@ struct undo_stack {
          if (keep_undo_segment > 0)
             check(batch.DeleteRange(to_slice(create_segment_key(0)),
                                     to_slice(create_segment_key(keep_undo_segment - 1))),
-                  "delete range:");
+                  "undo_stack::commit: rocksdb::WriteBatch::DeleteRange: ");
          write_state(batch);
          db.write(batch);
       }
    }
 
    void write_state(rocksdb::WriteBatch& batch) {
-      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))), "set: ");
+      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
+            "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
    }
 
    void write_state() {
@@ -398,7 +399,7 @@ struct undo_stack {
          if (segment.empty())
             return;
          auto key = create_segment_key(state.next_undo_segment++);
-         check(batch.Put(to_slice(key), to_slice(segment)), "set: ");
+         check(batch.Put(to_slice(key), to_slice(segment)), "undo_stack::write_changes: rocksdb::WriteBatch::Put: ");
          ++state.undo_stack.back();
          segment.clear();
       };
@@ -418,9 +419,10 @@ struct undo_stack {
       while (it != cache.end()) {
          if (compare_value(it->second.orig_value, it->second.current_value)) {
             if (it->second.current_value)
-               check(batch.Put(to_slice(it->first), to_slice(*it->second.current_value)), "set: ");
+               check(batch.Put(to_slice(it->first), to_slice(*it->second.current_value)),
+                     "undo_stack::write_changes: rocksdb::WriteBatch::Put: ");
             else
-               check(batch.Delete(to_slice(it->first)), "erase: ");
+               check(batch.Delete(to_slice(it->first)), "undo_stack::write_changes: rocksdb::WriteBatch::Erase: ");
 
             bool first_in_segment = segment.empty();
             if (!state.undo_stack.empty()) {
@@ -471,7 +473,7 @@ struct write_session {
          dest.clear();
          return false;
       }
-      check(stat, "get: ");
+      check(stat, "write_session::get: rocksdb::DB::Get: ");
 
       auto value          = to_shared_bytes(v);
       cache[std::move(k)] = cached_value{ 0, value, value };
@@ -498,7 +500,7 @@ struct write_session {
          return;
       }
 
-      check(stat, "get: ");
+      check(stat, "write_session::set: rocksdb::DB::Get: ");
       if (compare_blob(v, orig_v)) {
          auto [it, b] = cache.insert(
                cache_map::value_type{ std::move(k), cached_value{ 0, to_shared_bytes(orig_v), to_shared_bytes(v) } });
@@ -529,7 +531,7 @@ struct write_session {
          return;
       }
 
-      check(stat, "get: ");
+      check(stat, "write_session::erase: rocksdb::DB::Get: ");
       auto [it, b] =
             cache.insert(cache_map::value_type{ std::move(k), cached_value{ 1, to_shared_bytes(orig_v), nullptr } });
       changed(it);
@@ -578,13 +580,13 @@ class view {
          next_prefix = get_next_prefix(this->prefix);
 
          rocks_it->Seek(to_slice(this->prefix));
-         check(rocks_it->status(), "seek: ");
+         check(rocks_it->status(), "view::iterator_impl::iterator_impl: rocksdb::Iterator::Seek: ");
          view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
          rocks_it->Prev();
-         check(rocks_it->status(), "prev: ");
+         check(rocks_it->status(), "view::iterator_impl::iterator_impl: rocksdb::Iterator::Prev: ");
          view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
          rocks_it->Seek(to_slice(next_prefix));
-         check(rocks_it->status(), "seek: ");
+         check(rocks_it->status(), "view::iterator_impl::iterator_impl: rocksdb::Iterator::Seek: ");
          view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
 
          move_to_end();
@@ -614,14 +616,14 @@ class view {
 
       void lower_bound_full_key(const bytes& full_key) {
          rocks_it->Seek(to_slice(full_key));
-         check(rocks_it->status(), "seek: ");
+         check(rocks_it->status(), "view::iterator_impl::lower_bound_full_key: rocksdb::Iterator::Seek: ");
          cache_it = view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
          if (compare_blob(cache_it->first, to_slice(full_key)))
             cache_it = view.write_session.cache.lower_bound(full_key);
          while (!cache_it->second.current_value) {
             while (compare_blob(rocks_it->key(), cache_it->first) <= 0) {
                rocks_it->Next();
-               check(rocks_it->status(), "next: ");
+               check(rocks_it->status(), "view::iterator_impl::lower_bound_full_key: rocksdb::Iterator::Next: ");
                view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
             }
             ++cache_it;
@@ -657,7 +659,7 @@ class view {
          do {
             while (compare_blob(rocks_it->key(), cache_it->first) <= 0) {
                rocks_it->Next();
-               check(rocks_it->status(), "next: ");
+               check(rocks_it->status(), "view::iterator_impl::operator++: rocksdb::Iterator::Next: ");
                view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
             }
             ++cache_it;
@@ -672,7 +674,7 @@ class view {
       iterator_impl& operator--() {
          if (cache_it == view.write_session.cache.end()) {
             rocks_it->Seek(to_slice(next_prefix));
-            check(rocks_it->status(), "seek: ");
+            check(rocks_it->status(), "view::iterator_impl::operator--: rocksdb::Iterator::Seek: ");
             cache_it = view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
             if (compare_blob(cache_it->first, to_slice(next_prefix)))
                cache_it = view.write_session.cache.lower_bound(next_prefix);
@@ -681,7 +683,7 @@ class view {
          do {
             while (compare_blob(rocks_it->key(), cache_it->first) >= 0) {
                rocks_it->Prev();
-               check(rocks_it->status(), "prev: ");
+               check(rocks_it->status(), "view::iterator_impl::operator--: rocksdb::Iterator::Prev: ");
                view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
             }
             --cache_it;
