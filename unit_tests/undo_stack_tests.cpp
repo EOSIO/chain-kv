@@ -4,7 +4,7 @@
 using chain_kv::bytes;
 using chain_kv::to_slice;
 
-BOOST_AUTO_TEST_SUITE(undoer_tests)
+BOOST_AUTO_TEST_SUITE(undo_stack_tests)
 
 void undo_tests(bool reload_undo) {
    boost::filesystem::remove_all("test-undo-db");
