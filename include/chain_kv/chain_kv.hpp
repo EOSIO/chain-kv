@@ -37,6 +37,7 @@ inline std::shared_ptr<bytes> to_shared_bytes(const rocksdb::Slice& v) {
    return std::make_shared<bytes>(v.data(), v.data() + v.size());
 }
 
+// Bypasses fc's vector size limit
 template <typename Stream>
 void pack_bytes(Stream& s, const bytes& b) {
    fc::unsigned_int size(b.size());
@@ -44,6 +45,13 @@ void pack_bytes(Stream& s, const bytes& b) {
       throw exception("bytes is too big");
    fc::raw::pack(s, size);
    s.write(b.data(), b.size());
+}
+
+template <typename Stream>
+void pack_optional_bytes(Stream& s, const bytes* b) {
+   fc::raw::pack(s, bool(b));
+   if (b)
+      pack_bytes(s, *b);
 }
 
 template <typename Stream>
@@ -55,6 +63,16 @@ std::pair<const char*, size_t> get_bytes(Stream& s) {
    auto data = s.pos();
    s.skip(size.value);
    return { data, size.value };
+}
+
+template <typename Stream>
+std::pair<const char*, size_t> get_optional_bytes(Stream& s) {
+   bool present;
+   fc::raw::unpack(s, present);
+   if (present)
+      return get_bytes(s);
+   else
+      return { nullptr, 0 };
 }
 
 template <typename A, typename B>
@@ -207,8 +225,12 @@ inline int compare_value(const std::shared_ptr<const bytes>& a, const std::share
 
 using cache_map = std::map<bytes, struct cached_value, less_blob>;
 
+// The cache serves these needs:
+//    * Keep track of changes that need to be written to rocksdb
+//    * Support reading writes
+//    * Support iteration logic
 struct cached_value {
-   uint64_t                     num_erases       = 0;
+   uint64_t                     num_erases       = 0; // For iterator invalidation
    std::shared_ptr<const bytes> orig_value       = {};
    std::shared_ptr<const bytes> current_value    = {};
    bool                         in_change_list   = false;
@@ -222,22 +244,11 @@ struct undo_state {
    uint64_t              next_undo_segment = 0;
 };
 
-enum class undo_type : uint8_t {
-   remove = 0,
-   put    = 1,
-};
-
 template <typename Stream>
-void pack_remove(Stream& s, const bytes& key) {
-   s << uint8_t(undo_type::remove);
+void pack_undo_segment(Stream& s, const bytes& key, const bytes* old_value, const bytes* new_value) {
    pack_bytes(s, key);
-}
-
-template <typename Stream>
-void pack_put(Stream& s, const bytes& key, const bytes& value) {
-   s << uint8_t(undo_type::put);
-   pack_bytes(s, key);
-   pack_bytes(s, value);
+   pack_optional_bytes(s, old_value);
+   pack_optional_bytes(s, new_value);
 }
 
 struct undo_stack {
@@ -327,19 +338,14 @@ struct undo_stack {
          auto                        segment = rocks_it->value();
          fc::datastream<const char*> ds(segment.data(), segment.size());
          while (ds.remaining()) {
-            uint8_t type;
-            fc::raw::unpack(ds, type);
-            if (type == (uint8_t)undo_type::remove) {
-               auto [key, key_size] = get_bytes(ds);
-               check(batch.Delete({ key, key_size }), "undo_stack::undo: rocksdb::WriteBatch::Delete: ");
-            } else if (type == (uint8_t)undo_type::put) {
-               auto [key, key_size]     = get_bytes(ds);
-               auto [value, value_size] = get_bytes(ds);
-               check(batch.Put({ key, key_size }, { value, value_size }),
+            auto [key, key_size]             = get_bytes(ds);
+            auto [old_value, old_value_size] = get_optional_bytes(ds);
+            auto [new_value, new_value_size] = get_optional_bytes(ds);
+            if (old_value)
+               check(batch.Put({ key, key_size }, { old_value, old_value_size }),
                      "undo_stack::undo: rocksdb::WriteBatch::Put: ");
-            } else {
-               throw exception("unknown undo_type");
-            }
+            else
+               check(batch.Delete({ key, key_size }), "undo_stack::undo: rocksdb::WriteBatch::Delete: ");
          }
          check(batch.Delete(segment_key), "undo_stack::undo: rocksdb::WriteBatch::Delete: ");
          rocks_it->Prev();
@@ -427,11 +433,9 @@ struct undo_stack {
 
             bool first_in_segment = segment.empty();
             if (!state.undo_stack.empty()) {
-               if (it->second.orig_value) {
-                  append_segment([&](auto& stream) { pack_put(stream, it->first, *it->second.orig_value); });
-               } else {
-                  append_segment([&](auto& stream) { pack_remove(stream, it->first); });
-               }
+               append_segment([&](auto& stream) {
+                  pack_undo_segment(stream, it->first, it->second.orig_value.get(), it->second.current_value.get());
+               });
             }
          }
          it = it->second.change_list_next;
@@ -580,6 +584,7 @@ class view {
       {
          next_prefix = get_next_prefix(this->prefix);
 
+         // Fill the cache with boundary points to simplify iteration logic
          rocks_it->Seek(to_slice(this->prefix));
          check(rocks_it->status(), "view::iterator_impl::iterator_impl: rocksdb::Iterator::Seek: ");
          view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
