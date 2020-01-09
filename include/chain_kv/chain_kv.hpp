@@ -139,7 +139,7 @@ struct database {
       check(rocksdb::DB::Open(options, db_path, &p), "rocksdb::DB::Open: ");
       rdb.reset(p);
 
-      // Sentinals with keys 0x00 and 0xff simplify iteration logic.
+      // Sentinels with keys 0x00 and 0xff simplify iteration logic.
       // Views have prefixes which must start with a byte within the range 0x01 - 0xfe.
       rocksdb::WriteBatch batch;
       bool                modified       = false;
@@ -254,7 +254,7 @@ struct undo_stack {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
 
-      // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
+      // Sentinels reserve 0x00 and 0xff. This keeps rocksdb iterators from going
       // invalid during iteration.
       if (this->undo_prefix[0] == 0x00 || this->undo_prefix[0] == (char)0xff)
          throw exception("undo_stack may not have a prefix which begins with 0x00 or 0xff");
@@ -774,7 +774,7 @@ class view {
       if (this->prefix.empty())
          throw exception("kv view may not have empty prefix");
 
-      // Sentinals reserve 0x00 and 0xff. This keeps rocksdb iterators from going
+      // Sentinels reserve 0x00 and 0xff. This keeps rocksdb iterators from going
       // invalid during iteration. This also allows get_next_prefix() to function correctly.
       if (this->prefix[0] == 0x00 || this->prefix[0] == (char)0xff)
          throw exception("view may not have a prefix which begins with 0x00 or 0xff");
