@@ -161,8 +161,51 @@ void view_test(bool reload_session) {
                                                               { { (char)0xb0 }, { (char)0xfc } },
                                                         } }));
 
-   // !!! iterator prefix tests
+   view->set(0xf00df00d, to_slice({ 0x10, 0x20, 0x00 }), to_slice({ (char)0x70 }));
+   view->set(0xf00df00d, to_slice({ 0x10, 0x20, 0x01 }), to_slice({ (char)0x71 }));
+   view->set(0xf00df00d, to_slice({ 0x10, 0x20, 0x02 }), to_slice({ (char)0x72 }));
 
+   view->set(0xf00df00d, to_slice({ 0x10, 0x30, 0x00 }), to_slice({ (char)0x70 }));
+   view->set(0xf00df00d, to_slice({ 0x10, 0x30, 0x01 }), to_slice({ (char)0x71 }));
+   view->set(0xf00df00d, to_slice({ 0x10, 0x30, 0x02 }), to_slice({ (char)0x72 }));
+
+   view->set(0xf00df00d, to_slice({ 0x20, 0x00 }), to_slice({ (char)0x70 }));
+   view->set(0xf00df00d, to_slice({ 0x20, 0x01 }), to_slice({ (char)0x71 }));
+   view->set(0xf00df00d, to_slice({ 0x20, 0x02 }), to_slice({ (char)0x72 }));
+   reload();
+
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10, 0x20 }), (kv_values{ {
+                                                                              { { 0x10, 0x20, 0x00 }, { 0x70 } },
+                                                                              { { 0x10, 0x20, 0x01 }, { 0x71 } },
+                                                                              { { 0x10, 0x20, 0x02 }, { 0x72 } },
+                                                                        } }));
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10, 0x20 }),
+                       get_matching2(*view, 0xf00df00d, { 0x10, 0x20 }));
+
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10, 0x30 }), (kv_values{ {
+                                                                              { { 0x10, 0x30, 0x00 }, { 0x70 } },
+                                                                              { { 0x10, 0x30, 0x01 }, { 0x71 } },
+                                                                              { { 0x10, 0x30, 0x02 }, { 0x72 } },
+                                                                        } }));
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10, 0x30 }),
+                       get_matching2(*view, 0xf00df00d, { 0x10, 0x30 }));
+
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10 }), (kv_values{ {
+                                                                        { { 0x10, 0x20, 0x00 }, { 0x70 } },
+                                                                        { { 0x10, 0x20, 0x01 }, { 0x71 } },
+                                                                        { { 0x10, 0x20, 0x02 }, { 0x72 } },
+                                                                        { { 0x10, 0x30, 0x00 }, { 0x70 } },
+                                                                        { { 0x10, 0x30, 0x01 }, { 0x71 } },
+                                                                        { { 0x10, 0x30, 0x02 }, { 0x72 } },
+                                                                  } }));
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x10 }), get_matching2(*view, 0xf00df00d, { 0x10 }));
+
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x20 }), (kv_values{ {
+                                                                        { { 0x20, 0x00 }, { 0x70 } },
+                                                                        { { 0x20, 0x01 }, { 0x71 } },
+                                                                        { { 0x20, 0x02 }, { 0x72 } },
+                                                                  } }));
+   BOOST_REQUIRE_EQUAL(get_matching(*view, 0xf00df00d, { 0x20 }), get_matching2(*view, 0xf00df00d, { 0x20 }));
 } // view_test()
 
 BOOST_AUTO_TEST_CASE(test_view) {
