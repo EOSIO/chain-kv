@@ -212,7 +212,7 @@ inline int compare_key(const std::optional<key_value>& a, const std::optional<ke
 }
 
 inline int compare_value(const std::shared_ptr<const bytes>& a, const std::shared_ptr<const bytes>& b) {
-   // nullptr represents erased; everything else is after erased
+   // nullptr represents erased; everything else, including empty, is after erased
    if (!a && !b)
       return 0;
    else if (!a && b)
@@ -251,7 +251,8 @@ void pack_undo_segment(Stream& s, const bytes& key, const bytes* old_value, cons
    pack_optional_bytes(s, new_value);
 }
 
-struct undo_stack {
+class undo_stack {
+ private:
    database&  db;
    bytes      undo_prefix;
    uint64_t   target_segment_size;
@@ -260,6 +261,7 @@ struct undo_stack {
    bytes      segment_next_prefix;
    undo_state state;
 
+ public:
    undo_stack(database& db, bytes&& undo_prefix, uint64_t target_segment_size = 64 * 1024 * 1024)
        : db{ db }, undo_prefix{ std::move(undo_prefix) }, target_segment_size{ target_segment_size } {
       if (this->undo_prefix.empty())
@@ -378,25 +380,10 @@ struct undo_stack {
       }
    }
 
-   void write_state(rocksdb::WriteBatch& batch) {
-      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
-            "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
-   }
-
-   void write_state() {
-      rocksdb::WriteBatch batch;
-      write_state(batch);
-      db.write(batch);
-   }
-
-   bytes create_segment_key(uint64_t segment) {
-      bytes key;
-      key.reserve(segment_prefix.size() + sizeof(segment));
-      key.insert(key.end(), segment_prefix.begin(), segment_prefix.end());
-      append_key(key, segment);
-      return key;
-   }
-
+   // Write changes in `change_list`. Everything in `change_list` must belong to `cache`.
+   //
+   // It is undefined behavior if any `orig_value` in `change_list` doesn't match the
+   // database's current state.
    void write_changes(cache_map& cache, cache_map::iterator change_list) {
       rocksdb::WriteBatch batch;
       bytes               segment;
@@ -430,8 +417,6 @@ struct undo_stack {
                      "undo_stack::write_changes: rocksdb::WriteBatch::Put: ");
             else
                check(batch.Delete(to_slice(it->first)), "undo_stack::write_changes: rocksdb::WriteBatch::Erase: ");
-
-            bool first_in_segment = segment.empty();
             if (!state.undo_stack.empty()) {
                append_segment([&](auto& stream) {
                   pack_undo_segment(stream, it->first, it->second.orig_value.get(), it->second.current_value.get());
@@ -444,9 +429,38 @@ struct undo_stack {
       write_segment();
       write_state(batch);
       db.write(batch);
-   } // write()
-};   // undo_stack
+   } // write_changes()
 
+ private:
+   void write_state(rocksdb::WriteBatch& batch) {
+      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
+            "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
+   }
+
+   void write_state() {
+      rocksdb::WriteBatch batch;
+      write_state(batch);
+      db.write(batch);
+   }
+
+   bytes create_segment_key(uint64_t segment) {
+      bytes key;
+      key.reserve(segment_prefix.size() + sizeof(segment));
+      key.insert(key.end(), segment_prefix.begin(), segment_prefix.end());
+      append_key(key, segment);
+      return key;
+   }
+}; // undo_stack
+
+// Supports reading and writing through a cache_map
+//
+// Caution: write_session will misbehave if it's used to read or write a key that
+// that is changed elsewhere during write_session's lifetime. e.g. through another
+// simultaneous write_session, unless that write_session is never written to the
+// database.
+//
+// Extra keys stored in the cache used only as sentinels are exempt from this
+// restriction.
 struct write_session {
    database&           db;
    cache_map           cache;
@@ -454,6 +468,7 @@ struct write_session {
 
    write_session(database& db) : db{ db } {}
 
+   // Add item to change_list
    void changed(cache_map::iterator it) {
       if (it->second.in_change_list)
          return;
@@ -462,6 +477,10 @@ struct write_session {
       change_list                 = it;
    }
 
+   // Get a value. Includes any changes written to cache.
+   //
+   // Returns true and sets `dest` if key-value exists.
+   // Returns false and clears `dest` if key-value doesn't exist.
    bool get(bytes&& k, bytes& dest) {
       auto it = cache.find(k);
       if (it != cache.end()) {
@@ -486,6 +505,7 @@ struct write_session {
       return true;
    }
 
+   // Write a key-value to cache and add to change_list if changed.
    void set(bytes&& k, const rocksdb::Slice& v) {
       auto it = cache.find(k);
       if (it != cache.end()) {
@@ -516,6 +536,7 @@ struct write_session {
       }
    }
 
+   // Mark key as erased in the cache and add to change_list if changed. Bumps `num_erases` to invalidate iterators.
    void erase(bytes&& k) {
       {
          auto it = cache.find(k);
@@ -542,6 +563,8 @@ struct write_session {
       changed(it);
    }
 
+   // Fill cache with a key-value pair read from the database. Does not undo any changes (e.g. set() or erase())
+   // already made to the cache. Returns an iterator to the freshly-created or already-existing cache entry.
    cache_map::iterator fill_cache(const rocksdb::Slice& k, const rocksdb::Slice& v) {
       cache_map::iterator it;
       bool                b;
@@ -553,6 +576,10 @@ struct write_session {
       return it;
    }
 
+   // Write changes in `change_list` to database. See undo_stack::write_changes.
+   //
+   // Caution: write_session will misbehave if it's used after the changes are written.
+   // e.g. it will corrupt the undo stack.
    void write_changes(undo_stack& u) { u.write_changes(cache, change_list); }
 }; // write_session
 
@@ -584,7 +611,8 @@ class view {
       {
          next_prefix = get_next_prefix(this->prefix);
 
-         // Fill the cache with boundary points to simplify iteration logic
+         // Fill the cache with sentinel keys to simplify iteration logic. These may be either
+         // the reserved 0x00 or 0xff sentinels, or keys from regions neighboring prefix.
          rocks_it->Seek(to_slice(this->prefix));
          check(rocks_it->status(), "view::iterator_impl::iterator_impl: rocksdb::Iterator::Seek: ");
          view.write_session.fill_cache(rocks_it->key(), rocks_it->value());
