@@ -6,14 +6,14 @@ using chain_kv::to_slice;
 
 BOOST_AUTO_TEST_SUITE(undo_stack_tests)
 
-void undo_tests(bool reload_undo) {
+void undo_tests(bool reload_undo, uint64_t target_segment_size) {
    boost::filesystem::remove_all("test-undo-db");
    chain_kv::database                    db{ "test-undo-db", true };
    std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
       if (!undo_stack || reload_undo)
-         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 });
+         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 }, target_segment_size);
    };
    reload();
 
@@ -109,14 +109,14 @@ void undo_tests(bool reload_undo) {
 
 } // undo_tests()
 
-void squash_tests(bool reload_undo) {
+void squash_tests(bool reload_undo, uint64_t target_segment_size) {
    boost::filesystem::remove_all("test-squash-db");
    chain_kv::database                    db{ "test-squash-db", true };
    std::unique_ptr<chain_kv::undo_stack> undo_stack;
 
    auto reload = [&] {
       if (!undo_stack || reload_undo)
-         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 });
+         undo_stack = std::make_unique<chain_kv::undo_stack>(db, bytes{ 0x10 }, target_segment_size);
    };
    reload();
 
@@ -253,13 +253,17 @@ void squash_tests(bool reload_undo) {
 } // squash_tests()
 
 BOOST_AUTO_TEST_CASE(test_undo) {
-   undo_tests(false);
-   undo_tests(true);
+   undo_tests(false, 0);
+   undo_tests(true, 0);
+   undo_tests(false, 64 * 1024 * 1024);
+   undo_tests(true, 64 * 1024 * 1024);
 }
 
 BOOST_AUTO_TEST_CASE(test_squash) {
-   squash_tests(false);
-   squash_tests(true);
+   squash_tests(false, 0);
+   squash_tests(true, 0);
+   squash_tests(false, 64 * 1024 * 1024);
+   squash_tests(true, 64 * 1024 * 1024);
 }
 
 BOOST_AUTO_TEST_SUITE_END();

@@ -243,13 +243,14 @@ void pack_put(Stream& s, const bytes& key, const bytes& value) {
 struct undo_stack {
    database&  db;
    bytes      undo_prefix;
+   uint64_t   target_segment_size;
    bytes      state_prefix;
    bytes      segment_prefix;
    bytes      segment_next_prefix;
-   uint64_t   target_segment_size = 64 * 1024 * 1024;
    undo_state state;
 
-   undo_stack(database& db, bytes&& undo_prefix) : db{ db }, undo_prefix{ std::move(undo_prefix) } {
+   undo_stack(database& db, bytes&& undo_prefix, uint64_t target_segment_size = 64 * 1024 * 1024)
+       : db{ db }, undo_prefix{ std::move(undo_prefix) }, target_segment_size{ target_segment_size } {
       if (this->undo_prefix.empty())
          throw exception("undo_prefix is empty");
 
