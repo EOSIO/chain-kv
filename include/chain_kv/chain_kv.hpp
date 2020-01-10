@@ -371,10 +371,8 @@ class undo_stack {
          uint64_t keep_undo_segment = state.next_undo_segment;
          for (auto n : state.undo_stack) //
             keep_undo_segment -= n;
-         if (keep_undo_segment > 0)
-            check(batch.DeleteRange(to_slice(create_segment_key(0)),
-                                    to_slice(create_segment_key(keep_undo_segment - 1))),
-                  "undo_stack::commit: rocksdb::WriteBatch::DeleteRange: ");
+         check(batch.DeleteRange(to_slice(create_segment_key(0)), to_slice(create_segment_key(keep_undo_segment))),
+               "undo_stack::commit: rocksdb::WriteBatch::DeleteRange: ");
          write_state(batch);
          db.write(batch);
       }
