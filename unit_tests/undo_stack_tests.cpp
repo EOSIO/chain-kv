@@ -252,6 +252,8 @@ void squash_tests(bool reload_undo, uint64_t target_segment_size) {
    BOOST_REQUIRE_EQUAL(get_all(db, { 0x20 }), (kv_values{ {} }));
 } // squash_tests()
 
+// !!! commit() tests
+
 BOOST_AUTO_TEST_CASE(test_undo) {
    undo_tests(false, 0);
    undo_tests(true, 0);

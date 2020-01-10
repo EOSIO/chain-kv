@@ -583,6 +583,11 @@ struct write_session {
    void write_changes(undo_stack& u) { u.write_changes(cache, change_list); }
 }; // write_session
 
+// A view of the database with a restricted range (prefix). Implements part of
+// https://github.com/EOSIO/spec-repo/blob/master/esr_key_value_database_intrinsics.md,
+// including iterator wrap-around behavior.
+//
+// Keys have this format: prefix, contract, user-provided key.
 class view {
  public:
    class iterator;
@@ -684,6 +689,10 @@ class view {
          return cache_it != view.write_session.cache.end() && cache_it_num_erases == cache_it->second.num_erases;
       }
 
+      bool is_erased() {
+         return cache_it != view.write_session.cache.end() && cache_it_num_erases != cache_it->second.num_erases;
+      }
+
       iterator_impl& operator++() {
          if (cache_it == view.write_session.cache.end()) {
             move_to_begin();
@@ -731,6 +740,7 @@ class view {
    }; // iterator_impl
 
  public:
+   // Iterates through a user-provided prefix within view's keyspace.
    class iterator {
       friend view;
 
@@ -752,7 +762,17 @@ class view {
       iterator& operator=(const iterator&) = delete;
       iterator& operator=(iterator&&) = default;
 
-      friend int  compare(const iterator& a, const iterator& b) { return compare_key(a.get_kv(), b.get_kv()); }
+      // Compare 2 iterators. Throws if the iterators are from different views.
+      // Also throws if either iterator is at an erased kv pair. non-end iterators
+      // compare less than end iterators.
+      friend int compare(const iterator& a, const iterator& b) {
+         a.check_initialized();
+         b.check_initialized();
+         if (&a.impl->view != &b.impl->view)
+            throw exception("iterators are from different views");
+         return compare_key(a.impl->get_kv(), b.impl->get_kv());
+      }
+
       friend bool operator==(const iterator& a, const iterator& b) { return compare(a, b) == 0; }
       friend bool operator!=(const iterator& a, const iterator& b) { return compare(a, b) != 0; }
       friend bool operator<(const iterator& a, const iterator& b) { return compare(a, b) < 0; }
@@ -794,11 +814,20 @@ class view {
          return impl->is_end();
       }
 
+      // true if !is_end() and not at an erased kv pair
       bool is_valid() const {
          check_initialized();
          return impl->is_valid();
       }
 
+      // true if !is_end() and is at an erased kv pair
+      bool is_erased() const {
+         check_initialized();
+         return impl->is_erased();
+      }
+
+      // Get key_value at current position. Returns nullopt if at end. Throws if at an erased kv pair.
+      // The returned key does not include the view's prefix or the contract.
       std::optional<key_value> get_kv() const {
          check_initialized();
          return impl->get_kv();
@@ -816,14 +845,17 @@ class view {
          throw exception("view may not have a prefix which begins with 0x00 or 0xff");
    }
 
+   // Get a key-value pair
    bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
       return write_session.get(create_full_key(prefix, contract, k), dest);
    }
 
+   // Set a key-value pair
    void set(uint64_t contract, const rocksdb::Slice& k, const rocksdb::Slice& v) {
       write_session.set(create_full_key(prefix, contract, k), v);
    }
 
+   // Erase a key-value pair
    void erase(uint64_t contract, const rocksdb::Slice& k) { write_session.erase(create_full_key(prefix, contract, k)); }
 }; // view
 
