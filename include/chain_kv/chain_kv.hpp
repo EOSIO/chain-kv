@@ -132,7 +132,7 @@ struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
    database(const char* db_path, bool create_if_missing, std::optional<uint32_t> threads = {},
-            std::optional<uint32_t> max_open_files = {}) {
+            std::optional<int> max_open_files = {}) {
 
       rocksdb::Options options;
       options.create_if_missing                    = create_if_missing;
