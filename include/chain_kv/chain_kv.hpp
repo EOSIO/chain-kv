@@ -292,7 +292,7 @@ class undo_stack {
 
    int64_t revision() const { return state.revision; }
 
-   void set_revision(uint64_t revision) {
+   void set_revision(uint64_t revision, bool write_now = true) {
       if (state.undo_stack.size() != 0)
          throw exception("cannot set revision while there is an existing undo stack");
       if (revision > std::numeric_limits<int64_t>::max())
@@ -300,29 +300,32 @@ class undo_stack {
       if (revision < state.revision)
          throw exception("revision cannot decrease");
       state.revision = revision;
-      write_state();
+      if (write_now)
+         write_state();
    }
 
    // Create a new entry on the undo stack
-   void push() {
+   void push(bool write_now = true) {
       state.undo_stack.push_back(0);
       ++state.revision;
-      write_state();
+      if (write_now)
+         write_state();
    }
 
    // Combine the top two states on the undo stack
-   void squash() {
+   void squash(bool write_now = true) {
       if (state.undo_stack.size() < 2)
          throw exception("nothing to squash");
       auto n = state.undo_stack.back();
       state.undo_stack.pop_back();
       state.undo_stack.back() += n;
       --state.revision;
-      write_state();
+      if (write_now)
+         write_state();
    }
 
    // Reset the contents to the state at the top of the undo stack
-   void undo() {
+   void undo(bool write_now = true) {
       if (state.undo_stack.empty())
          throw exception("nothing to undo");
       rocksdb::WriteBatch batch;
@@ -337,12 +340,13 @@ class undo_stack {
          auto segment_key = rocks_it->key();
          if (compare_blob(segment_key, first) < 0)
             break;
+         write_now                           = true;
          auto                        segment = rocks_it->value();
          fc::datastream<const char*> ds(segment.data(), segment.size());
          while (ds.remaining()) {
             auto [key, key_size]             = get_bytes(ds);
             auto [old_value, old_value_size] = get_optional_bytes(ds);
-            auto [new_value, new_value_size] = get_optional_bytes(ds);
+            get_optional_bytes(ds);
             if (old_value)
                check(batch.Put({ key, key_size }, { old_value, old_value_size }),
                      "undo_stack::undo: rocksdb::WriteBatch::Put: ");
@@ -357,8 +361,10 @@ class undo_stack {
       state.next_undo_segment -= state.undo_stack.back();
       state.undo_stack.pop_back();
       --state.revision;
-      write_state(batch);
-      db.write(batch);
+      if (write_now) {
+         write_state(batch);
+         db.write(batch);
+      }
    }
 
    // Discard all undo history prior to revision
@@ -429,16 +435,16 @@ class undo_stack {
       db.write(batch);
    } // write_changes()
 
- private:
-   void write_state(rocksdb::WriteBatch& batch) {
-      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
-            "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
-   }
-
    void write_state() {
       rocksdb::WriteBatch batch;
       write_state(batch);
       db.write(batch);
+   }
+
+ private:
+   void write_state(rocksdb::WriteBatch& batch) {
+      check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
+            "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
    }
 
    bytes create_segment_key(uint64_t segment) {
