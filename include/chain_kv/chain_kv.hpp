@@ -481,32 +481,22 @@ struct write_session {
       change_list                 = it;
    }
 
-   // Get a value. Includes any changes written to cache.
-   //
-   // Returns true and sets `dest` if key-value exists.
-   // Returns false and clears `dest` if key-value doesn't exist.
-   bool get(bytes&& k, bytes& dest) {
+   // Get a value. Includes any changes written to cache. Returns nullptr
+   // if key-value doesn't exist.
+   std::shared_ptr<const bytes> get(bytes&& k) {
       auto it = cache.find(k);
-      if (it != cache.end()) {
-         if (it->second.current_value)
-            dest = *it->second.current_value;
-         else
-            dest.clear();
-         return it->second.current_value != nullptr;
-      }
+      if (it != cache.end())
+         return it->second.current_value;
 
       rocksdb::PinnableSlice v;
       auto                   stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &v);
-      if (stat.IsNotFound()) {
-         dest.clear();
-         return false;
-      }
+      if (stat.IsNotFound())
+         return nullptr;
       check(stat, "write_session::get: rocksdb::DB::Get: ");
 
       auto value          = to_shared_bytes(v);
       cache[std::move(k)] = cached_value{ 0, value, value };
-      dest                = *value;
-      return true;
+      return value;
    }
 
    // Write a key-value to cache and add to change_list if changed.
@@ -849,9 +839,10 @@ class view {
          throw exception("view may not have a prefix which begins with 0x00 or 0xff");
    }
 
-   // Get a key-value pair
-   bool get(uint64_t contract, const rocksdb::Slice& k, bytes& dest) {
-      return write_session.get(create_full_key(prefix, contract, k), dest);
+   // Get a value. Includes any changes written to cache. Returns nullptr
+   // if key doesn't exist.
+   std::shared_ptr<const bytes> get(uint64_t contract, const rocksdb::Slice& k) {
+      return write_session.get(create_full_key(prefix, contract, k));
    }
 
    // Set a key-value pair

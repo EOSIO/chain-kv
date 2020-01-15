@@ -67,8 +67,8 @@ inline kv_values get_values(chain_kv::write_session& session, const std::vector<
    kv_values result;
    for (auto& key : keys) {
       chain_kv::bytes value;
-      if (session.get(chain_kv::bytes{ key }, value))
-         result.values.push_back({ key, value });
+      if (auto value = session.get(chain_kv::bytes{ key }))
+         result.values.push_back({ key, *value });
    }
    return result;
 }
