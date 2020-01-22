@@ -572,9 +572,12 @@ struct write_session {
 
    // Write changes in `change_list` to database. See undo_stack::write_changes.
    //
-   // Caution: write_session will misbehave if it's used after the changes are written.
-   // e.g. it will corrupt the undo stack.
-   void write_changes(undo_stack& u) { u.write_changes(cache, change_list); }
+   // Caution: write_changes wipes the cache, which invalidates iterators
+   void write_changes(undo_stack& u) {
+      u.write_changes(cache, change_list);
+      cache.clear();
+      change_list = cache.end();
+   }
 }; // write_session
 
 // A view of the database with a restricted range (prefix). Implements part of
