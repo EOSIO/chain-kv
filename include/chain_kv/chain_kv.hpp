@@ -466,11 +466,18 @@ class undo_stack {
 // Extra keys stored in the cache used only as sentinels are exempt from this
 // restriction.
 struct write_session {
-   database&           db;
-   cache_map           cache;
-   cache_map::iterator change_list = cache.end();
+   database&                db;
+   const rocksdb::Snapshot* snapshot;
+   cache_map                cache;
+   cache_map::iterator      change_list = cache.end();
 
-   write_session(database& db) : db{ db } {}
+   write_session(database& db, const rocksdb::Snapshot* snapshot = nullptr) : db{ db }, snapshot{ snapshot } {}
+
+   rocksdb::ReadOptions read_options() {
+      rocksdb::ReadOptions r;
+      r.snapshot = snapshot;
+      return r;
+   }
 
    // Add item to change_list
    void changed(cache_map::iterator it) {
@@ -489,7 +496,7 @@ struct write_session {
          return it->second.current_value;
 
       rocksdb::PinnableSlice v;
-      auto                   stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &v);
+      auto                   stat = db.rdb->Get(read_options(), db.rdb->DefaultColumnFamily(), to_slice(k), &v);
       if (stat.IsNotFound())
          return nullptr;
       check(stat, "write_session::get: rocksdb::DB::Get: ");
@@ -511,7 +518,7 @@ struct write_session {
       }
 
       rocksdb::PinnableSlice orig_v;
-      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
+      auto                   stat = db.rdb->Get(read_options(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
       if (stat.IsNotFound()) {
          auto [it, b] =
                cache.insert(cache_map::value_type{ std::move(k), cached_value{ 0, nullptr, to_shared_bytes(v) } });
@@ -545,7 +552,7 @@ struct write_session {
       }
 
       rocksdb::PinnableSlice orig_v;
-      auto stat = db.rdb->Get(rocksdb::ReadOptions(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
+      auto                   stat = db.rdb->Get(read_options(), db.rdb->DefaultColumnFamily(), to_slice(k), &orig_v);
       if (stat.IsNotFound()) {
          cache[std::move(k)] = cached_value{ 0, nullptr, nullptr };
          return;
@@ -606,10 +613,10 @@ class view {
       std::unique_ptr<rocksdb::Iterator> rocks_it;
 
       iterator_impl(chain_kv::view& view, uint64_t contract, const rocksdb::Slice& prefix)
-          : view{ view },                                                              //
-            prefix{ create_full_key(view.prefix, contract, prefix) },                  //
-            hidden_prefix_size{ view.prefix.size() + sizeof(contract) },               //
-            rocks_it{ view.write_session.db.rdb->NewIterator(rocksdb::ReadOptions()) } //
+          : view{ view },                                                                         //
+            prefix{ create_full_key(view.prefix, contract, prefix) },                             //
+            hidden_prefix_size{ view.prefix.size() + sizeof(contract) },                          //
+            rocks_it{ view.write_session.db.rdb->NewIterator(view.write_session.read_options()) } //
       {
          next_prefix = get_next_prefix(this->prefix);
 
