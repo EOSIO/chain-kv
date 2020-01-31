@@ -582,6 +582,11 @@ struct write_session {
    // Caution: write_changes wipes the cache, which invalidates iterators
    void write_changes(undo_stack& u) {
       u.write_changes(cache, change_list);
+      wipe_cache();
+   }
+
+   // Wipe the cache. Invalidates iterators.
+   void wipe_cache() {
       cache.clear();
       change_list = cache.end();
    }
