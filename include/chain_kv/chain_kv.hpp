@@ -291,6 +291,7 @@ class undo_stack {
    }
 
    int64_t revision() const { return state.revision; }
+   int64_t first_revision() const { return state.revision - state.undo_stack.size(); }
 
    void set_revision(uint64_t revision, bool write_now = true) {
       if (state.undo_stack.size() != 0)
