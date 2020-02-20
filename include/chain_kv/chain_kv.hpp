@@ -315,8 +315,18 @@ class undo_stack {
 
    // Combine the top two states on the undo stack
    void squash(bool write_now = true) {
-      if (state.undo_stack.size() < 2)
-         throw exception("nothing to squash");
+      if (state.undo_stack.empty()) {
+         return;
+      } else if (state.undo_stack.size() == 1) {
+         rocksdb::WriteBatch batch;
+         check(batch.DeleteRange(to_slice(create_segment_key(0)), to_slice(create_segment_key(state.next_undo_segment))),
+               "undo_stack::squash: rocksdb::WriteBatch::DeleteRange: ");
+         state.undo_stack.clear();
+         --state.revision;
+         write_state(batch);
+         db.write(batch);
+         return;
+      }
       auto n = state.undo_stack.back();
       state.undo_stack.pop_back();
       state.undo_stack.back() += n;
