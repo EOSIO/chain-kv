@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fc/io/raw.hpp>
+#include <fc/scoped_exit.hpp>
 #include <optional>
 #include <rocksdb/db.h>
 #include <rocksdb/table.h>
@@ -179,6 +180,11 @@ struct database {
    database(database&&) = default;
    database& operator=(database&&) = default;
 
+   void close() {
+      check(rdb->Close(), "database::close: rocksdb::DB::Close: ");
+      rdb.reset();
+   }
+
    void flush(bool allow_write_stall, bool wait) {
       rocksdb::FlushOptions op;
       op.allow_write_stall = allow_write_stall;
@@ -260,6 +266,8 @@ class undo_stack {
    bytes      segment_prefix;
    bytes      segment_next_prefix;
    undo_state state;
+   // Should be equal to state.revision unless an undo failed
+   int64_t    target_revision;
 
  public:
    undo_stack(database& db, bytes&& undo_prefix, uint64_t target_segment_size = 64 * 1024 * 1024)
@@ -288,6 +296,7 @@ class undo_stack {
             throw exception("invalid undo format");
          state = fc::raw::unpack<undo_state>(v.data(), v.size());
       }
+      target_revision = state.revision;
    }
 
    int64_t revision() const { return state.revision; }
@@ -300,43 +309,98 @@ class undo_stack {
          throw exception("revision to set is too high");
       if (revision < state.revision)
          throw exception("revision cannot decrease");
+      auto guard = fc::make_scoped_exit([&state, saved=state.revision] {
+         state.revision = saved;
+      });
       state.revision = revision;
       if (write_now)
          write_state();
+      target_revision = state.revision;
    }
 
    // Create a new entry on the undo stack
+   // Exception Safety: Strong
    void push(bool write_now = true) {
+      check_sync();
+      auto guard = fc::make_scoped_exit([&state] {
+         --state.revision;
+         state.undo_stack.pop_back();
+      });
       state.undo_stack.push_back(0);
       ++state.revision;
       if (write_now)
          write_state();
+      guard.cancel();
+      target_revision = state.revision;
    }
 
    // Combine the top two states on the undo stack
+   // Exception Safety: Strong
    void squash(bool write_now = true) {
+      check_sync();
       if (state.undo_stack.empty()) {
          return;
       } else if (state.undo_stack.size() == 1) {
          rocksdb::WriteBatch batch;
          check(batch.DeleteRange(to_slice(create_segment_key(0)), to_slice(create_segment_key(state.next_undo_segment))),
                "undo_stack::squash: rocksdb::WriteBatch::DeleteRange: ");
+         auto guard = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
+            ++state.revision;
+            state.undo_stack.push_back(saved);
+         });
          state.undo_stack.clear();
          --state.revision;
          write_state(batch);
          db.write(batch);
+         guard.cancel();
+         target_revision = state.revision;
          return;
       }
       auto n = state.undo_stack.back();
+      auto guard = fc::make_scoped_exit([&state, n] {
+         ++state.revision;
+         state.undo_stack.back() -= n;
+         state.undo_stack.push_back(saved);
+      });
       state.undo_stack.pop_back();
       state.undo_stack.back() += n;
       --state.revision;
       if (write_now)
          write_state();
+      guard.cancel();
+      target_revision = state.revision;
+   }
+
+   // Revert to the given revision
+   void undo_to(int64_t revision) {
+      if(revision > state.revision)
+         throw exception("invalid revision");
+      target_revision = revision;
+      sync();
+   }
+
+   // Retry failed undos.
+   void sync() {
+      while(state.revision > target_revision) {
+         undo_impl();
+      }
+   }
+
+   // Verify that there are no pending failed undos.
+   void check_sync() const {
+      if(target_revision != state.revision)
+         throw exception("out of sync");
    }
 
    // Reset the contents to the state at the top of the undo stack
+   // If this throws, other functions will fail until
    void undo(bool write_now = true) {
+      --target_revision;
+      undo_impl(write_now);
+      check_sync();
+   }
+
+   void undo_impl(bool write_now = true) {
       if (state.undo_stack.empty())
          throw exception("nothing to undo");
       rocksdb::WriteBatch batch;
@@ -369,6 +433,11 @@ class undo_stack {
       }
       check(rocks_it->status(), "undo_stack::undo: iterate rocksdb: ");
 
+      auto guard = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
+         ++state.revision;
+         state.undo_stack.push_back(saved);
+         state.next_undo_segment += saved;
+      });
       state.next_undo_segment -= state.undo_stack.back();
       state.undo_stack.pop_back();
       --state.revision;
@@ -376,6 +445,7 @@ class undo_stack {
          write_state(batch);
          db.write(batch);
       }
+      guard.cancel();
    }
 
    // Discard all undo history prior to revision
@@ -383,11 +453,14 @@ class undo_stack {
       revision            = std::min(revision, state.revision);
       auto first_revision = state.revision - state.undo_stack.size();
       if (first_revision < revision) {
-         rocksdb::WriteBatch batch;
          state.undo_stack.erase(state.undo_stack.begin(), state.undo_stack.begin() + (revision - first_revision));
          uint64_t keep_undo_segment = state.next_undo_segment;
          for (auto n : state.undo_stack) //
             keep_undo_segment -= n;
+         // Can only throw after here.  If this fails it's relatively harmless.  The database
+         // will just end up storing extra undo states.  These extra undo states will be cleaned
+         // up on the next successful commit.
+         rocksdb::WriteBatch batch;
          check(batch.DeleteRange(to_slice(create_segment_key(0)), to_slice(create_segment_key(keep_undo_segment))),
                "undo_stack::commit: rocksdb::WriteBatch::DeleteRange: ");
          write_state(batch);
@@ -453,6 +526,15 @@ class undo_stack {
    }
 
  private:
+
+   auto state_guard() {
+      return = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
+         ++state.revision;
+         state.undo_stack.push_back(saved);
+         state.next_undo_segment += saved;
+      });
+   }
+  
    void write_state(rocksdb::WriteBatch& batch) {
       check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
             "undo_stack::write_state: rocksdb::WriteBatch::Put: ");
