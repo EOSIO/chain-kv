@@ -129,6 +129,8 @@ bytes create_full_key(const bytes& prefix, uint64_t contract, const T& key) {
    return result;
 }
 
+inline int fail_counter = -1;
+
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
@@ -193,10 +195,19 @@ struct database {
    }
 
    void write(rocksdb::WriteBatch& batch) {
+      maybe_fail();
       rocksdb::WriteOptions opt;
       opt.disableWAL = true;
       check(rdb->Write(opt, &batch), "database::write: rocksdb::DB::Write (batch)");
       batch.Clear();
+   }
+
+   void maybe_fail() {
+      if(fail_counter == 0) {
+         throw exception("triggered error");
+      } else if(fail_counter > 0) {
+         --fail_counter;
+      }
    }
 }; // database
 
@@ -309,7 +320,7 @@ class undo_stack {
          throw exception("revision to set is too high");
       if (revision < state.revision)
          throw exception("revision cannot decrease");
-      auto guard = fc::make_scoped_exit([&state, saved=state.revision] {
+      auto guard = fc::make_scoped_exit([this, saved=state.revision] {
          state.revision = saved;
       });
       state.revision = revision;
