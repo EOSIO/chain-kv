@@ -129,8 +129,6 @@ bytes create_full_key(const bytes& prefix, uint64_t contract, const T& key) {
    return result;
 }
 
-inline int fail_counter = -1;
-
 struct database {
    std::unique_ptr<rocksdb::DB> rdb;
 
@@ -209,6 +207,7 @@ struct database {
          --fail_counter;
       }
    }
+   int fail_counter = -1;
 }; // database
 
 struct key_value {
@@ -326,6 +325,7 @@ class undo_stack {
       state.revision = revision;
       if (write_now)
          write_state();
+      guard.cancel();
       target_revision = state.revision;
    }
 
@@ -333,7 +333,7 @@ class undo_stack {
    // Exception Safety: Strong
    void push(bool write_now = true) {
       check_sync();
-      auto guard = fc::make_scoped_exit([&state] {
+      auto guard = fc::make_scoped_exit([this] {
          --state.revision;
          state.undo_stack.pop_back();
       });
@@ -355,7 +355,7 @@ class undo_stack {
          rocksdb::WriteBatch batch;
          check(batch.DeleteRange(to_slice(create_segment_key(0)), to_slice(create_segment_key(state.next_undo_segment))),
                "undo_stack::squash: rocksdb::WriteBatch::DeleteRange: ");
-         auto guard = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
+         auto guard = fc::make_scoped_exit([this, saved=state.undo_stack.back()] {
             ++state.revision;
             state.undo_stack.push_back(saved);
          });
@@ -368,10 +368,10 @@ class undo_stack {
          return;
       }
       auto n = state.undo_stack.back();
-      auto guard = fc::make_scoped_exit([&state, n] {
+      auto guard = fc::make_scoped_exit([this, n] {
          ++state.revision;
          state.undo_stack.back() -= n;
-         state.undo_stack.push_back(saved);
+         state.undo_stack.push_back(n);
       });
       state.undo_stack.pop_back();
       state.undo_stack.back() += n;
@@ -444,7 +444,7 @@ class undo_stack {
       }
       check(rocks_it->status(), "undo_stack::undo: iterate rocksdb: ");
 
-      auto guard = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
+      auto guard = fc::make_scoped_exit([this, saved=state.undo_stack.back()] {
          ++state.revision;
          state.undo_stack.push_back(saved);
          state.next_undo_segment += saved;
@@ -537,14 +537,6 @@ class undo_stack {
    }
 
  private:
-
-   auto state_guard() {
-      return = fc::make_scoped_exit([&state, saved=undo_stack.back()] {
-         ++state.revision;
-         state.undo_stack.push_back(saved);
-         state.next_undo_segment += saved;
-      });
-   }
   
    void write_state(rocksdb::WriteBatch& batch) {
       check(batch.Put(to_slice(state_prefix), to_slice(fc::raw::pack(state))),
