@@ -612,8 +612,8 @@ class view {
  public:
    class iterator;
 
-   write_session& write_session;
-   const bytes    prefix;
+   chain_kv::write_session& write_session;
+   const bytes              prefix;
 
  private:
    struct iterator_impl {
